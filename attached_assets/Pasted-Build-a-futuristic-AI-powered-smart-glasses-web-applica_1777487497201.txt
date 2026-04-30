@@ -1,0 +1,211 @@
+Build a futuristic AI-powered smart glasses web application called “Scarl” (Smart Cognitive Augmented Reality Lens) using Python as the main backend technology.
+
+This should work as the software base for a real-world wearable assistant project.
+
+This should feel like a real JARVIS-style HUD interface, not a normal website.
+
+The project is a browser-based prototype for smart glasses where a phone can be mounted on a wearable frame/cardboard headset and used like low-cost AR glasses.
+
+The entire screen should function as the smart glasses view.
+
+This is important:
+
+I do NOT want a normal website layout with separate sections like a dashboard.
+
+The full screen must show exactly what the phone camera sees in real time, and all AI information should appear as overlays directly on top of that live camera feed, like true augmented reality glasses.
+
+Think:
+
+camera feed = background
+
+AI overlays = floating HUD elements on top
+
+Similar to:
+
+Iron Man HUD
+Google Glass
+military tactical AR display
+real wearable smart glasses interface
+
+Main goal:
+
+The system should use the phone camera (or uploaded image for MVP) to analyze what the user is seeing, send that visual input to AI models like NVIDIA NIM Vision APIs, reason about the scene using an LLM layer, and then respond with contextual overlays and voice output like JARVIS.
+
+The interface should look sleek, futuristic, minimal, immersive, and believable as an actual wearable assistant system.
+
+Tech stack preference:
+
+Backend must be built using Python.
+
+Preferred backend:
+
+FastAPI (preferred)
+
+or Flask if needed
+
+Frontend can use:
+
+HTML + CSS + JavaScript
+
+or React if needed for smoother UI and scalability
+
+Python must handle:
+
+camera analysis pipeline
+AI API integration
+voice logic
+memory/context system
+backend architecture
+real-time communication
+
+Core features required:
+
+1. Full-Screen Live Camera Interface
+
+* Access mobile camera directly from browser
+* Camera feed must cover the full screen
+* No traditional webpage layout
+* Allow capture snapshot for analysis
+* Also support image upload as fallback for MVP
+* Smooth mobile browser support
+
+2. Real AR-Style Overlay System
+
+All assistant outputs must appear as overlays directly on the camera feed:
+
+* object labels
+* warning alerts
+* contextual suggestions
+* target boxes
+* directional indicators
+* assistant status
+* threat alerts
+* reminders
+* navigation prompts
+
+Examples:
+
+⚠ Charger overheating detected
+
+Medicine strip recognized → medication reminder suggested
+
+You have been inactive for 2 hours
+
+Person approaching from left
+
+These should feel like floating AR overlays, not chat messages.
+
+3. Minimal Assistant Layer (Only if Needed)
+
+If needed, keep a very small assistant response layer that does not block the screen.
+
+No large dashboard.
+
+Priority is always the camera + overlays.
+
+4. Voice Assistant Mode
+
+* Button for “Scarl, Analyze Scene”
+* Basic voice input support
+* Text-to-speech output for assistant replies
+* Listening animation
+* Speaking indicator
+* Voice-first interaction preferred
+
+The assistant should feel conversational and ambient.
+
+5. HUD Interface Design
+
+Style requirements:
+
+* dark transparent overlay elements
+* subtle neon/glow accents
+* minimal clean futuristic design
+* tactical system aesthetic
+* elegant believable interface
+* lightweight overlays only
+
+Top-left small system status:
+
+* battery
+* AI online/offline
+* connection status
+* active mode
+
+Bottom area:
+
+* voice interaction state
+* listening / analyzing / responding
+
+Center:
+
+* smart detection overlays only
+
+No clutter.
+
+6. Python Backend API Structure
+
+Create backend-ready architecture using FastAPI with clean modular structure for:
+
+* image upload endpoint
+* live frame capture handling
+* OpenCV integration for lightweight local detection
+* MediaPipe support if needed
+* NVIDIA NIM API integration placeholder
+* reasoning model placeholder
+* response generation system
+* contextual memory system
+* WebSocket-ready real-time communication
+* event-triggered analysis support
+* voice assistant backend logic
+
+Do not hardcode fake toy examples only.
+
+Create scalable production-style architecture that can later connect to real APIs and be deployed professionally.
+
+7. Mobile-first Design
+
+Since the phone will be mounted like wearable smart glasses, the entire system must be optimized for mobile browsers first.
+
+Performance matters heavily.
+
+Low latency matters.
+
+Clean responsiveness matters.
+
+8. Clean Downloadable Project Structure
+
+I want this as a professional starter base I can download and continue building locally.
+
+Include:
+
+* frontend
+* backend
+* Python project structure
+* proper folders
+* reusable components
+* scalable architecture
+* comments for API integration points
+* requirements.txt
+* clean setup instructions
+* environment variable support for API keys
+
+Important:
+
+Do not make this feel like a college demo project.
+
+Do not make this look like a dashboard website.
+
+This should feel like a real startup-grade wearable AI product prototype.
+
+Prioritize:
+
+performance
+clean architecture
+real usability
+future scalability
+immersive full-screen AR experience
+
+Keep it realistic and buildable.
+
+The final output should feel like actual smart glasses software, not just a website.
