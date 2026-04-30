@@ -158,19 +158,21 @@ export function HUD() {
     );
   };
 
-  // Continuous monitoring loop
+  // Event-based monitoring trigger
   useEffect(() => {
     if (!autoMode) return;
-    const id = setInterval(() => {
-      if (analyzeScene.isPending) return;
-      if (voiceState === 'speaking') return;
-      if (Date.now() - lastAnalyzeAtRef.current < AUTO_INTERVAL_MS - 500) return;
-      if (!latestFrameRef.current) return;
-      triggerAnalyze();
-    }, 1000);
-    return () => clearInterval(id);
+    if (analyzeScene.isPending) return;
+    if (voiceState === 'speaking') return;
+    
+    // Throttle repeated calls (e.g. max 1 request every AUTO_INTERVAL_MS - 500)
+    // Wait, since we want to be responsive to motion, we could reduce the timeout
+    // but the instruction says "throttle requests, queue, debounce repeated calls".
+    if (Date.now() - lastAnalyzeAtRef.current < AUTO_INTERVAL_MS - 500) return;
+    if (!latestFrameRef.current) return;
+    
+    triggerAnalyze();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoMode, voiceState, analyzeScene.isPending]);
+  }, [latestFrame, autoMode, voiceState, analyzeScene.isPending]);
 
   const handleToggleAuto = () => setAutoMode((v) => !v);
 

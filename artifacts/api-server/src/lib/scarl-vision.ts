@@ -145,6 +145,64 @@ function fallbackResult(reason: string): VisionResult {
   };
 }
 
+const NIM_ROUTER_MODEL = process.env["NVIDIA_NIM_ROUTER_MODEL"] ?? "meta/llama-3.2-11b-vision-instruct";
+const NIM_COSMOS_MODEL = process.env["NVIDIA_NIM_COSMOS_MODEL"] ?? "nvidia/cosmos-nemotron-34b";
+const NIM_OCR_MODEL = process.env["NVIDIA_NIM_OCR_MODEL"] ?? "nvidia/nv-ocr-v1";
+const NIM_REASONER_MODEL = process.env["NVIDIA_NIM_REASONER_MODEL"] ?? "nvidia/nemotron-mini-4b-instruct";
+
+async function callNimChat(
+  model: string,
+  messages: any[],
+  apiKey: string,
+  log: Logger,
+  options: { maxTokens?: number; temp?: number; timeoutMs?: number } = {}
+) {
+  const { maxTokens = 1024, temp = 0.2, timeoutMs = 3000 } = options;
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${NIM_BASE_URL}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: temp,
+        top_p: 0.9,
+        max_tokens: maxTokens,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      log.error({ status: response.status, body: body.slice(0, 500), model }, "NIM error");
+      throw new Error(`NIM ${response.status} from ${model}`);
+    }
+
+    const json = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const text = json.choices?.[0]?.message?.content ?? "";
+    if (!text) {
+      throw new Error(`Empty response from model ${model}`);
+    }
+    return text;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`TIMEOUT: ${model} took >${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export async function analyzeFrame(args: {
   imageBase64: string;
   mimeType: string;
@@ -170,70 +228,99 @@ export async function analyzeFrame(args: {
 
   const dataUrl = `data:${mimeType};base64,${imageBase64}`;
 
-  const userInstruction = [
-    `Mode: ${mode ?? "scan"}.`,
-    prompt
-      ? `User said: "${prompt}". Treat this as a direct question — answer it concisely in spokenReply.`
-      : "Standard ambient scan.",
-    "Return the JSON object now.",
-  ].join(" ");
-
-  // NIM's vision models expect the image as an inline HTML <img> tag inside
-  // the user message string, not as an OpenAI-style image_url content part.
-  const userContent = `${userInstruction}\n\n<img src="${dataUrl}" />`;
-
   try {
-    const response = await fetch(`${NIM_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        model: NIM_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userContent },
-        ],
-        temperature: 0.2,
-        top_p: 0.9,
-        max_tokens: 1024,
-        stream: false,
-      }),
-    });
+    // 1. Router: Determine if Environment or Text-heavy
+    // Bypass router if hints are present in prompt or mode
+    const lowerPrompt = (prompt ?? "").toLowerCase();
+    const isExplicitText = lowerPrompt.includes("read") || lowerPrompt.includes("text") || lowerPrompt.includes("say");
+    const isExplicitScan = mode === "scan" || mode === "monitor";
 
-    if (!response.ok) {
-      const body = await response.text();
-      log.error({ status: response.status, body: body.slice(0, 500) }, "NIM error");
-      return fallbackResult(`NIM ${response.status}`);
+    let isTextHeavy = isExplicitText && !isExplicitScan;
+    
+    if (!isExplicitText && !isExplicitScan) {
+      try {
+        log.info("Step 1: Routing image content (2s timeout)...");
+        const routerInstruction = "Respond with EXACTLY ONE WORD: 'TEXT' if this image is primarily a document, screen, or text-heavy. Otherwise respond with 'ENVIRONMENT'.";
+        const routerRes = await callNimChat(NIM_ROUTER_MODEL, [
+          { role: "user", content: `${routerInstruction}\n\n<img src="${dataUrl}" />` }
+        ], apiKey, log, { maxTokens: 5, temp: 0.1, timeoutMs: 2000 });
+        
+        isTextHeavy = routerRes.trim().toUpperCase().includes("TEXT");
+        log.info({ isTextHeavy, routerRes }, "Routing decision");
+      } catch (err) {
+        log.warn({ err }, "Router failed or timed out, defaulting to ENVIRONMENT");
+        isTextHeavy = false;
+      }
+    } else {
+      log.info({ isTextHeavy, mode, prompt }, "Router bypassed via hints");
     }
 
-    const json = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const text = json.choices?.[0]?.message?.content ?? "";
-    if (!text) {
-      log.warn("Empty NIM response");
-      return fallbackResult("Empty response from vision model.");
+    // 2. Extractor: Cosmos for Environment, OCR for Text
+    let extractedContext = "";
+    try {
+      if (isTextHeavy) {
+        log.info(`Step 2: Extracting text using ${NIM_OCR_MODEL} (3s timeout)...`);
+        const ocrInstruction = "Extract all readable text from this image exactly as written.";
+        extractedContext = await callNimChat(NIM_OCR_MODEL, [
+          { role: "user", content: `${ocrInstruction}\n\n<img src="${dataUrl}" />` }
+        ], apiKey, log, { maxTokens: 1024, temp: 0.1, timeoutMs: 3000 });
+      } else {
+        log.info(`Step 2: Analyzing environment using ${NIM_COSMOS_MODEL} (3s timeout)...`);
+        const cosmosInstruction = "Describe this scene, objects, and any potential hazards in detail.";
+        extractedContext = await callNimChat(NIM_COSMOS_MODEL, [
+          { role: "user", content: `${cosmosInstruction}\n\n<img src="${dataUrl}" />` }
+        ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
+      }
+    } catch (err) {
+      log.warn({ err }, "Extractor failed or timed out, using fallback context");
+      extractedContext = isTextHeavy ? "Unable to read text." : "Environment detected.";
     }
 
-    const parsed = tryParseJson(text) as Record<string, unknown>;
-    const overlaysRaw = Array.isArray(parsed.overlays) ? parsed.overlays : [];
+    // 3. Reasoner: Generate final JSON using Nemotron Reasoning
+    try {
+      log.info(`Step 3: Reasoning final output using ${NIM_REASONER_MODEL} (3s timeout)...`);
+      const userInstruction = [
+        `Mode: ${mode ?? "scan"}.`,
+        prompt
+          ? `User said: "${prompt}". Treat this as a direct question — answer it concisely in spokenReply.`
+          : "Standard ambient scan.",
+        `Context extracted from vision: "${extractedContext}"`,
+        "Return the JSON object now based solely on the context provided.",
+      ].join("\n");
 
-    return {
-      sceneSummary:
-        typeof parsed.sceneSummary === "string" && parsed.sceneSummary.length > 0
-          ? parsed.sceneSummary.slice(0, 140)
-          : "Scene captured.",
-      spokenReply:
-        typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
-      primaryFocus:
-        typeof parsed.primaryFocus === "string" ? parsed.primaryFocus : "scene",
-      overlays: overlaysRaw.slice(0, 12).map(normalizeOverlay),
-    };
+      const text = await callNimChat(NIM_REASONER_MODEL, [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userInstruction }
+      ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
+
+      const parsed = tryParseJson(text) as Record<string, unknown>;
+      const overlaysRaw = Array.isArray(parsed.overlays) ? parsed.overlays : [];
+
+      return {
+        sceneSummary:
+          typeof parsed.sceneSummary === "string" && parsed.sceneSummary.length > 0
+            ? parsed.sceneSummary.slice(0, 140)
+            : "Scene captured.",
+        spokenReply:
+          typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
+        primaryFocus:
+          typeof parsed.primaryFocus === "string" ? parsed.primaryFocus : "scene",
+        overlays: overlaysRaw.slice(0, 12).map(normalizeOverlay),
+      };
+    } catch (err) {
+      log.warn({ err }, "Reasoner failed or timed out, using fallback JSON builder");
+      // Fallback: Manually build a result from the extracted context
+      return {
+        sceneSummary: isTextHeavy ? "Text captured." : "Environment scan complete.",
+        spokenReply: extractedContext.length > 100 
+          ? extractedContext.slice(0, 150) + "..." 
+          : extractedContext,
+        primaryFocus: isTextHeavy ? "text" : "environment",
+        overlays: [], // Skip overlays on total failure
+      };
+    }
   } catch (err) {
-    log.error({ err }, "Vision analysis failed");
+    log.error({ err }, "Vision analysis pipeline crashed");
     const reason = err instanceof Error ? err.message : "Unknown error.";
     return fallbackResult(reason);
   }
