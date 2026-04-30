@@ -151,7 +151,19 @@ export function HUD() {
             setVoiceState(isVoiceMuted ? 'idle' : 'listening');
           }
         },
-        onError: () => {
+        onError: (err) => {
+          console.error('[SCARL] API error:', err);
+          setOverlays([{
+            id: 'error-overlay',
+            kind: 'warning',
+            label: 'API Error',
+            detail: err instanceof Error ? err.message.slice(0, 60) : 'Request failed',
+            severity: 'high',
+            x: 0.5,
+            y: 0.5,
+            w: 0.4,
+            h: 0.15,
+          }]);
           setVoiceState(isVoiceMuted ? 'idle' : 'listening');
         },
       }

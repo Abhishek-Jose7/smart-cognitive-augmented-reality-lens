@@ -26,10 +26,25 @@ app.use(
     },
   }),
 );
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+
+// Allow all origins for now (frontend is on a different Vercel domain)
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+}));
+
+// Increase body limit — base64 JPEG frames can be 100-200KB
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 app.use("/api", router);
+
+// Catch-all error handler so Vercel doesn't swallow errors silently
+app.use((err: any, _req: any, res: any, _next: any) => {
+  logger.error({ err }, "Unhandled error");
+  res.status(500).json({ error: "internal_server_error", message: err.message });
+});
 
 export default app;
