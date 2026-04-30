@@ -148,7 +148,7 @@ function fallbackResult(reason: string): VisionResult {
 const NIM_ROUTER_MODEL = process.env["NVIDIA_NIM_ROUTER_MODEL"] ?? "meta/llama-3.2-11b-vision-instruct";
 const NIM_COSMOS_MODEL = process.env["NVIDIA_NIM_COSMOS_MODEL"] ?? "nvidia/cosmos-nemotron-34b";
 const NIM_OCR_MODEL = process.env["NVIDIA_NIM_OCR_MODEL"] ?? "nvidia/nv-ocr-v1";
-const NIM_REASONER_MODEL = process.env["NVIDIA_NIM_REASONER_MODEL"] ?? "nvidia/nemotron-mini-4b-instruct";
+const NIM_REASONER_MODEL = process.env["NVIDIA_NIM_REASONER_MODEL"] ?? "meta/llama-3.2-11b-vision-instruct";
 
 async function callNimChat(
   model: string,
@@ -276,7 +276,7 @@ export async function analyzeFrame(args: {
       extractedContext = isTextHeavy ? "Unable to read text." : "Environment detected.";
     }
 
-    // 3. Reasoner: Generate final JSON using Nemotron Reasoning
+    // 3. Reasoner: Generate final JSON using Multimodal Reasoning
     try {
       log.info(`Step 3: Reasoning final output using ${NIM_REASONER_MODEL} (3s timeout)...`);
       const userInstruction = [
@@ -285,12 +285,13 @@ export async function analyzeFrame(args: {
           ? `User said: "${prompt}". Treat this as a direct question — answer it concisely in spokenReply.`
           : "Standard ambient scan.",
         `Context extracted from vision: "${extractedContext}"`,
-        "Return the JSON object now based solely on the context provided.",
+        "Based on the image and the context above, return the JSON object with precise bounding boxes.",
       ].join("\n");
 
+      // We MUST send the image again so the reasoner can determine coordinates
       const text = await callNimChat(NIM_REASONER_MODEL, [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userInstruction }
+        { role: "user", content: `${userInstruction}\n\n<img src="${dataUrl}" />` }
       ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
 
       const parsed = tryParseJson(text) as Record<string, unknown>;
