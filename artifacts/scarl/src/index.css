@@ -168,6 +168,9 @@
     @apply font-mono antialiased bg-background text-foreground;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+    height: 100dvh;
+    width: 100vw;
+    min-height: -webkit-fill-available;
   }
 }
 
