@@ -16,10 +16,10 @@ type CocoModel = {
   }>>;
 };
 
-// Much faster detection for continuous real-time bounding
-const LOCAL_DETECTION_INTERVAL_MS = 350;
-const LOCAL_DETECTION_SCORE = 0.45;
-const LOCAL_DETECTION_MAX = 8;
+// Faster detection — 200ms for near-realtime bounding
+const LOCAL_DETECTION_INTERVAL_MS = 200;
+const LOCAL_DETECTION_SCORE = 0.35;
+const LOCAL_DETECTION_MAX = 10;
 
 const LABEL_MAP: Record<string, string> = {
   tv: 'TV',
@@ -62,6 +62,24 @@ const LABEL_MAP: Record<string, string> = {
   cake: 'Cake',
   bed: 'Bed',
   toilet: 'Toilet',
+  surfboard: 'Surfboard',
+  'sports ball': 'Ball',
+  'wine glass': 'Glass',
+  fork: 'Fork',
+  knife: 'Knife',
+  spoon: 'Spoon',
+  skateboard: 'Skateboard',
+  truck: 'Truck',
+  bus: 'Bus',
+  motorcycle: 'Motorcycle',
+  airplane: 'Airplane',
+  train: 'Train',
+  boat: 'Boat',
+  bird: 'Bird',
+  horse: 'Horse',
+  sheep: 'Sheep',
+  cow: 'Cow',
+  bear: 'Bear',
 };
 
 function labelFor(className: string) {
@@ -102,8 +120,8 @@ function mapVideoBoxToViewport(
   return {
     x: Math.min(Math.max(x, 0), 1),
     y: Math.min(Math.max(y, 0), 1),
-    w: Math.min(Math.max(width, 0.04), 0.85),
-    h: Math.min(Math.max(height, 0.04), 0.85),
+    w: Math.min(Math.max(width, 0.03), 0.9),
+    h: Math.min(Math.max(height, 0.03), 0.9),
   };
 }
 
@@ -121,14 +139,38 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
 
     async function startCamera() {
       try {
-        const constraints = {
+        // Request wide-angle camera with lower resolution for speed
+        // Lower resolution = faster COCO-SSD inference + wider FOV on many devices
+        const constraints: MediaStreamConstraints = {
           video: {
             facingMode: isFrontCamera ? 'user' : 'environment',
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            // Request widest possible field of view
+            ...(navigator.mediaDevices && {
+              advanced: [
+                { zoom: 1.0 } as any, // Minimum zoom = widest FOV
+              ],
+            }),
           },
         };
         stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+        // Try to set minimum zoom on the track for widest view
+        const videoTrack = stream.getVideoTracks()[0];
+        if (videoTrack) {
+          try {
+            const capabilities = videoTrack.getCapabilities?.() as any;
+            if (capabilities?.zoom?.min) {
+              await videoTrack.applyConstraints({
+                advanced: [{ zoom: capabilities.zoom.min } as any],
+              } as any);
+            }
+          } catch (_) {
+            // Zoom control not supported — that's fine
+          }
+        }
+
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
@@ -155,8 +197,8 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
         await import('@tensorflow/tfjs');
         const coco = await import('@tensorflow-models/coco-ssd');
         if (cancelled) return;
+        // lite_mobilenet_v2 is the fastest model variant
         detectorRef.current = await coco.load({ base: 'lite_mobilenet_v2' }) as CocoModel;
-        // Start detection loop once model is loaded
         scheduleDetection();
       } catch (err) {
         console.error('[SCARL] Local detector failed to load', err);
@@ -171,7 +213,6 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
     async function detectLoop(timestamp: number) {
       if (cancelled) return;
 
-      // Throttle to our interval
       if (timestamp - lastDetectTime >= LOCAL_DETECTION_INTERVAL_MS && !running) {
         lastDetectTime = timestamp;
         await detect();
@@ -224,14 +265,15 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
     };
   }, [fallbackImage, onLocalDetections]);
 
-  // Frame capture for API analysis (separate from local detection)
+  // Frame capture for API analysis
   const motionCanvasRef = useRef<HTMLCanvasElement>(null);
   const prevImageDataRef = useRef<Uint8ClampedArray | null>(null);
+  const frameCapturedRef = useRef(false);
 
   useEffect(() => {
     const MOTION_W = 64;
     const MOTION_H = 64;
-    const MSE_THRESHOLD = 600; // Lowered for faster responsiveness
+    const MSE_THRESHOLD = 300; // Lower threshold = capture more frames
 
     const captureInterval = setInterval(() => {
       if (!videoRef.current || !canvasRef.current || fallbackImage) return;
@@ -242,7 +284,6 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         let hasMotion = false;
 
-        // 1. Motion Detection (Local Filtering)
         if (motionCanvas) {
           motionCanvas.width = MOTION_W;
           motionCanvas.height = MOTION_H;
@@ -263,7 +304,6 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
                 hasMotion = true;
               }
             } else {
-              // First frame always has "motion" to trigger initial state
               hasMotion = true; 
             }
             
@@ -271,23 +311,24 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
           }
         }
 
-        // 2. Always capture on interval for API (even without motion, to keep analysis fresh)
-        // But prioritize motion frames
-        if (hasMotion || !prevImageDataRef.current) {
-          const MAX_W = 720;
+        // Always capture at least the first frame, then on motion or every capture cycle
+        if (hasMotion || !frameCapturedRef.current) {
+          frameCapturedRef.current = true;
+          // Smaller image = faster upload + within NIM inline limit
+          const MAX_W = 640;
           const ratio = video.videoWidth > MAX_W ? MAX_W / video.videoWidth : 1;
           canvas.width = Math.round(video.videoWidth * ratio);
           canvas.height = Math.round(video.videoHeight * ratio);
           const ctx = canvas.getContext('2d');
           if (ctx) {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
             const base64 = dataUrl.split(',')[1];
             onFrameCapture(base64);
           }
         }
       }
-    }, 800);
+    }, 600);
     return () => clearInterval(captureInterval);
   }, [onFrameCapture, fallbackImage]);
 
@@ -302,6 +343,8 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
           playsInline
           muted
           className="w-full h-full object-cover"
+          // Use contain instead of cover for wider view — less cropping
+          style={{ objectFit: 'contain' }}
         />
       )}
       <canvas ref={canvasRef} className="hidden" />
