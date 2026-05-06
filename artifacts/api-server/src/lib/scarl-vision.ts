@@ -30,6 +30,34 @@ const NIM_MODEL =
 const MAX_INLINE_IMAGE_BYTES = 180_000;
 const MAX_RETURNED_OVERLAYS = 4;
 
+const FALLBACK_BOX_SLOTS = [
+  { x: 0.32, y: 0.5, w: 0.24, h: 0.34 },
+  { x: 0.56, y: 0.52, w: 0.26, h: 0.32 },
+  { x: 0.74, y: 0.48, w: 0.22, h: 0.3 },
+  { x: 0.44, y: 0.72, w: 0.22, h: 0.24 },
+] as const;
+
+const OBJECT_LABELS = [
+  "person",
+  "laptop",
+  "screen",
+  "chair",
+  "table",
+  "sofa",
+  "couch",
+  "plant",
+  "tv",
+  "television",
+  "cabinet",
+  "door",
+  "window",
+  "bed",
+  "phone",
+  "book",
+  "bottle",
+  "cup",
+] as const;
+
 const SYSTEM_PROMPT = `You are Scarl — a Smart Cognitive Augmented Reality Lens — the AI inside a pair of wearable smart glasses worn by the user. You receive a single still frame from the user's field of view (landscape) and respond like a professional, calm assistant. Your job is to keep the user's view clear and only surface what matters.
 
 Return STRICT JSON ONLY (no prose, no markdown fences, no comments) with this exact shape:
@@ -170,6 +198,82 @@ function topOverlays(overlays: VisionOverlay[]): VisionOverlay[] {
     .map((overlay, index) => ({ ...overlay, id: overlay.id || `ov-${index + 1}` }));
 }
 
+function titleCase(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function buildFallbackOverlays(args: {
+  isTextHeavy: boolean;
+  extractedContext: string;
+}): VisionOverlay[] {
+  const { isTextHeavy, extractedContext } = args;
+  const context = extractedContext.toLowerCase();
+
+  if (isTextHeavy) {
+    return [
+      {
+        id: "ov-text-fallback",
+        kind: "text",
+        label: "Text",
+        detail: extractedContext.slice(0, 70) || "Readable text detected",
+        severity: "medium",
+        x: 0.5,
+        y: 0.55,
+        w: 0.56,
+        h: 0.32,
+      },
+    ];
+  }
+
+  const labels: string[] = [];
+  for (const label of OBJECT_LABELS) {
+    if (context.includes(label) && !labels.includes(label)) labels.push(label);
+    if (labels.length >= MAX_RETURNED_OVERLAYS) break;
+  }
+
+  const fallbackLabels = labels.length > 0 ? labels : ["scene"];
+
+  return fallbackLabels.slice(0, MAX_RETURNED_OVERLAYS).map((label, index) => {
+    const slot = FALLBACK_BOX_SLOTS[index] ?? FALLBACK_BOX_SLOTS[0];
+    return {
+      id: `ov-fallback-${index + 1}`,
+      kind: label === "person" ? "person" : "object",
+      label: titleCase(label === "tv" ? "TV" : label),
+      detail: index === 0 ? "Detected" : undefined,
+      severity: "low",
+      ...slot,
+    };
+  });
+}
+
+async function answerFromTextContext(args: {
+  extractedContext: string;
+  prompt?: string;
+  apiKey: string;
+  log: Logger;
+}): Promise<string> {
+  const { extractedContext, prompt, apiKey, log } = args;
+  const instruction = [
+    "You are Scarl. Use the visible text below to answer the user's likely need.",
+    "If it is a question, answer it directly. If it is a paragraph, summarize it.",
+    "Return one short spoken sentence only, no markdown.",
+    prompt ? `User prompt: ${prompt}` : "",
+    `Visible text: ${extractedContext}`,
+  ].filter(Boolean).join("\n");
+
+  return callNimChat(
+    NIM_REASONER_MODEL,
+    [{ role: "user", content: instruction }],
+    apiKey,
+    log,
+    { maxTokens: 120, temp: 0.2, timeoutMs: 5000 },
+  );
+}
+
 function fallbackResult(reason: string): VisionResult {
   return {
     sceneSummary: "Vision offline",
@@ -291,11 +395,11 @@ export async function analyzeFrame(args: {
     
     if (!isExplicitText) {
       try {
-        log.info("Step 1: Routing image content (2s timeout)...");
+        log.info("Step 1: Routing image content (4s timeout)...");
         const routerInstruction = "Respond with EXACTLY ONE WORD: 'TEXT' if this image contains a readable question, worksheet, document, screen, sign, paragraph, page, or other prominent text. Otherwise respond with 'ENVIRONMENT'.";
         const routerRes = await callNimChat(NIM_ROUTER_MODEL, [
           { role: "user", content: `${routerInstruction}\n\n<img src="${dataUrl}" />` }
-        ], apiKey, log, { maxTokens: 5, temp: 0.1, timeoutMs: 2000 });
+        ], apiKey, log, { maxTokens: 5, temp: 0.1, timeoutMs: 4000 });
         
         isTextHeavy = routerRes.trim().toUpperCase().includes("TEXT");
         log.info({ isTextHeavy, routerRes }, "Routing decision");
@@ -311,17 +415,17 @@ export async function analyzeFrame(args: {
     let extractedContext = "";
     try {
       if (isTextHeavy) {
-        log.info(`Step 2: Extracting text using ${NIM_OCR_MODEL} (3s timeout)...`);
+        log.info(`Step 2: Extracting text using ${NIM_OCR_MODEL} (8s timeout)...`);
         const ocrInstruction = "Extract all readable text from this image exactly as written.";
         extractedContext = await callNimChat(NIM_OCR_MODEL, [
           { role: "user", content: `${ocrInstruction}\n\n<img src="${dataUrl}" />` }
-        ], apiKey, log, { maxTokens: 1024, temp: 0.1, timeoutMs: 3000 });
+        ], apiKey, log, { maxTokens: 1024, temp: 0.1, timeoutMs: 8000 });
       } else {
-        log.info(`Step 2: Analyzing environment using ${NIM_COSMOS_MODEL} (3s timeout)...`);
+        log.info(`Step 2: Analyzing environment using ${NIM_COSMOS_MODEL} (8s timeout)...`);
         const cosmosInstruction = "Describe this scene, objects, and any potential hazards in detail.";
         extractedContext = await callNimChat(NIM_COSMOS_MODEL, [
           { role: "user", content: `${cosmosInstruction}\n\n<img src="${dataUrl}" />` }
-        ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
+        ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 8000 });
       }
     } catch (err) {
       log.warn({ err }, "Extractor failed or timed out, using fallback context");
@@ -330,7 +434,7 @@ export async function analyzeFrame(args: {
 
     // 3. Reasoner: Generate final JSON using Multimodal Reasoning
     try {
-      log.info(`Step 3: Reasoning final output using ${NIM_REASONER_MODEL} (3s timeout)...`);
+      log.info(`Step 3: Reasoning final output using ${NIM_REASONER_MODEL} (8s timeout)...`);
       const userInstruction = [
         `Mode: ${mode ?? "scan"}.`,
         prompt
@@ -347,10 +451,12 @@ export async function analyzeFrame(args: {
       const text = await callNimChat(NIM_REASONER_MODEL, [
         { role: "system", content: `${SYSTEM_PROMPT}\n\n${DETECTION_AND_TEXT_APPENDIX}` },
         { role: "user", content: `${userInstruction}\n\n<img src="${dataUrl}" />` }
-      ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
+      ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 8000 });
 
       const parsed = tryParseJson(text) as Record<string, unknown>;
       const overlaysRaw = Array.isArray(parsed.overlays) ? parsed.overlays : [];
+
+      const overlays = topOverlays(overlaysRaw.slice(0, 12).map(normalizeOverlay));
 
       return {
         sceneSummary:
@@ -361,18 +467,29 @@ export async function analyzeFrame(args: {
           typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
         primaryFocus:
           typeof parsed.primaryFocus === "string" ? parsed.primaryFocus : "scene",
-        overlays: topOverlays(overlaysRaw.slice(0, 12).map(normalizeOverlay)),
+        overlays: overlays.length > 0
+          ? overlays
+          : buildFallbackOverlays({ isTextHeavy, extractedContext }),
       };
     } catch (err) {
       log.warn({ err }, "Reasoner failed or timed out, using fallback JSON builder");
-      // Fallback: Manually build a result from the extracted context
+      let spokenReply = extractedContext.length > 100
+        ? extractedContext.slice(0, 150) + "..."
+        : extractedContext;
+
+      if (isTextHeavy && extractedContext && !extractedContext.toLowerCase().includes("unable to read")) {
+        try {
+          spokenReply = await answerFromTextContext({ extractedContext, prompt, apiKey, log });
+        } catch (answerErr) {
+          log.warn({ err: answerErr }, "Text-only answer fallback failed");
+        }
+      }
+
       return {
         sceneSummary: isTextHeavy ? "Text captured." : "Environment scan complete.",
-        spokenReply: extractedContext.length > 100 
-          ? extractedContext.slice(0, 150) + "..." 
-          : extractedContext,
+        spokenReply,
         primaryFocus: isTextHeavy ? "text" : "environment",
-        overlays: [], // Skip overlays on total failure
+        overlays: buildFallbackOverlays({ isTextHeavy, extractedContext }),
       };
     }
   } catch (err) {

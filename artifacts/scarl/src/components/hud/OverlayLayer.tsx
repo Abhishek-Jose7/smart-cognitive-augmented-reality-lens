@@ -21,8 +21,8 @@ const MAX_VISIBLE_OVERLAYS = 4;
 
 // How long a label stays visible after first/last appearance.
 // Important things linger longer; mundane objects fade fast.
-const NEW_OBJECT_DISPLAY_MS = 3500;
-const KNOWN_OBJECT_DISPLAY_MS = 1200;
+const NEW_OBJECT_DISPLAY_MS = 7000;
+const KNOWN_OBJECT_DISPLAY_MS = 7000;
 const IMPORTANT_DISPLAY_MS = 9000;
 
 function fingerprint(o: Overlay): string {
@@ -99,6 +99,10 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
         if (!wasKnown) {
           shouldSurface = true;
           displayMs = NEW_OBJECT_DISPLAY_MS;
+        } else if (incomingByKey.has(key)) {
+          // Keep boxes visible while the object/text is still in the current analysis.
+          shouldSurface = true;
+          displayMs = important ? IMPORTANT_DISPLAY_MS : KNOWN_OBJECT_DISPLAY_MS;
         } else if (important) {
           shouldSurface = true;
           displayMs = IMPORTANT_DISPLAY_MS;
