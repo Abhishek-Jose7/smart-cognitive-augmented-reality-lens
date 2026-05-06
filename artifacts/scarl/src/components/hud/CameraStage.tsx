@@ -194,7 +194,20 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
 
     async function loadDetector() {
       try {
-        await import('@tensorflow/tfjs');
+        const tf = await import('@tensorflow/tfjs');
+        
+        // Try WebGPU acceleration first for massive speedup
+        try {
+          await import('@tensorflow/tfjs-backend-webgpu');
+          await tf.setBackend('webgpu');
+          await tf.ready();
+          console.log('[SCARL] Using WebGPU backend for instant detection');
+        } catch (e) {
+          console.warn('[SCARL] WebGPU not supported on this device, falling back to default backend', e);
+          // Default to WebGL or CPU
+          await tf.ready();
+        }
+
         const coco = await import('@tensorflow-models/coco-ssd');
         if (cancelled) return;
         // lite_mobilenet_v2 is the fastest model variant
