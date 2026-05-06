@@ -18,7 +18,7 @@ type CocoModel = {
 
 // Faster detection — 200ms for near-realtime bounding
 const LOCAL_DETECTION_INTERVAL_MS = 200;
-const LOCAL_DETECTION_SCORE = 0.35;
+const LOCAL_DETECTION_SCORE = 0.25;
 const LOCAL_DETECTION_MAX = 10;
 
 const LABEL_MAP: Record<string, string> = {
@@ -315,14 +315,14 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
         if (hasMotion || !frameCapturedRef.current) {
           frameCapturedRef.current = true;
           // Smaller image = faster upload + within NIM inline limit
-          const MAX_W = 640;
+          const MAX_W = 480;
           const ratio = video.videoWidth > MAX_W ? MAX_W / video.videoWidth : 1;
           canvas.width = Math.round(video.videoWidth * ratio);
           canvas.height = Math.round(video.videoHeight * ratio);
           const ctx = canvas.getContext('2d');
           if (ctx) {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.4);
             const base64 = dataUrl.split(',')[1];
             onFrameCapture(base64);
           }
@@ -343,8 +343,6 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
           playsInline
           muted
           className="w-full h-full object-cover"
-          // Use contain instead of cover for wider view — less cropping
-          style={{ objectFit: 'contain' }}
         />
       )}
       <canvas ref={canvasRef} className="hidden" />
