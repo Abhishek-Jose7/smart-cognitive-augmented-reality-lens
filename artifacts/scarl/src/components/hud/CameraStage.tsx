@@ -18,7 +18,7 @@ type CocoModel = {
 
 // Faster detection — 200ms for near-realtime bounding
 const LOCAL_DETECTION_INTERVAL_MS = 200;
-const LOCAL_DETECTION_SCORE = 0.25;
+const LOCAL_DETECTION_SCORE = 0.45;
 const LOCAL_DETECTION_MAX = 10;
 
 const LABEL_MAP: Record<string, string> = {
