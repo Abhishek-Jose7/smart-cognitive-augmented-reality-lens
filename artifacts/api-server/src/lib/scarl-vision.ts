@@ -28,14 +28,7 @@ const NIM_MODEL =
 // upload to their assets endpoint, which is overkill for our use case — we just
 // trim instead. Frontend already JPEG-compresses at quality 0.7.
 const MAX_INLINE_IMAGE_BYTES = 180_000;
-const MAX_RETURNED_OVERLAYS = 4;
-
-const FALLBACK_BOX_SLOTS = [
-  { x: 0.32, y: 0.5, w: 0.24, h: 0.34 },
-  { x: 0.56, y: 0.52, w: 0.26, h: 0.32 },
-  { x: 0.74, y: 0.48, w: 0.22, h: 0.3 },
-  { x: 0.44, y: 0.72, w: 0.22, h: 0.24 },
-] as const;
+const MAX_RETURNED_OVERLAYS = 6;
 
 const OBJECT_LABELS = [
   "person",
@@ -56,6 +49,19 @@ const OBJECT_LABELS = [
   "book",
   "bottle",
   "cup",
+  "clock",
+  "vase",
+  "remote",
+  "microwave",
+  "oven",
+  "fridge",
+  "sink",
+  "car",
+  "bicycle",
+  "dog",
+  "cat",
+  "backpack",
+  "umbrella",
 ] as const;
 
 const SYSTEM_PROMPT = `You are Scarl — a Smart Cognitive Augmented Reality Lens — the AI inside a pair of wearable smart glasses worn by the user. You receive a single still frame from the user's field of view (landscape) and respond like a professional, calm assistant. Your job is to keep the user's view clear and only surface what matters.
@@ -80,10 +86,11 @@ Return STRICT JSON ONLY (no prose, no markdown fences, no comments) with this ex
 
 OVERLAY RULES — keep view UNCLUTTERED:
 - Box ONLY salient identifiable items. Skip background fill, generic ground, walls, sky, duplicates, tiny irrelevant trinkets.
-- Return 1 to 4 overlays. Prefer the most useful visible things. Empty list is fine if there's truly nothing notable.
+- Return 1 to 6 overlays. Prefer the most useful visible things. Empty list is fine if there's truly nothing notable.
 - Each overlay = one tightly-fit box around ONE thing. Coordinates normalized [0,1], (0,0) top-left, x/y are CENTER.
+- CRITICAL: Bounding boxes MUST tightly hug the actual object. Do NOT use centered fixed-size rectangles. Measure the actual position and size of each object in the image.
 - 'label' = short noun ("Laptop", "Mug", "Door", "Person", "Plant"). No all-caps, no exclamation, max 2 words.
-- 'detail' is OPTIONAL — include only when useful: a quoted reading of visible text, a state ("Open", "Half full", "Plugged in"), a hazard reason ("Hot — steam visible"). Max 50 chars. Omit otherwise.
+- 'detail' provides USEFUL CONTEXT about the object: its state, brand, color, what it's doing, or any readable text on it. Examples: "Open, silver MacBook", "Half full glass", "Black leather", "Samsung TV, off", "Red ceramic, steaming". Include detail for EVERY overlay. Max 50 chars.
 - 'kind' guidance:
     - 'object' for inanimate things (default)
     - 'person' for humans (do not guess identity)
@@ -97,30 +104,41 @@ OVERLAY RULES — keep view UNCLUTTERED:
 - ALWAYS provide non-trivial w and h (0.06 - 0.45). Tightly hug the actual object.
 
 SPEECH RULES (THIS IS IMPORTANT):
-- The frontend already labels objects visually. DO NOT narrate every object. Speech is for ASSISTANCE, not narration.
-- spokenReply may be an EMPTY STRING ("") if there is nothing genuinely useful to say. Prefer silence over chatter.
-- Speak ONLY in these cases:
-    1. The frame contains a question, request, or instructional text that the user could be asking about → ANSWER the question concisely. Example text "What is 12 + 7?" → spokenReply: "Twelve plus seven is nineteen."
-    2. The frame contains other prominent text the user would want read → quote it briefly. Example sign "Closed for renovation" → spokenReply: "The sign reads 'Closed for renovation'."
-    3. There is a hazard (kind=warning/threat or severity=high/critical) → lead with the hazard. Example: "Heads up — kettle is steaming, watch your hand."
-    4. There's a useful proactive insight (medicine, fatigue, navigation) → say it briefly.
-    5. The user asked a direct question via the prompt below → answer it.
-- Otherwise: spokenReply = "" (empty). DO NOT describe the room.
-- Max 1 sentence, ~16 words. Address the user as "you". No "I see…" intros.
+- The frontend displays ALL analysis as TEXT OVERLAYS. Speech is ONLY used when the user explicitly asks via wake word "Hey Friday".
+- spokenReply should contain the analysis text that will be shown as an on-screen text overlay. This is NOT spoken aloud by default.
+- Write spokenReply as a brief, useful analysis of what you see. Focus on actionable information, not just listing objects.
+- Examples of good spokenReply:
+    - "Living room with dining area. Table set for dinner, TV cabinet against the wall."
+    - "Indoor workspace — laptop open on desk, good lighting conditions."
+    - "The sign reads 'Closed for renovation'. Door is locked."
+    - "Kitchen counter with coffee maker brewing, steam rising from mug."
+- Max 2 sentences, ~25 words. Address the user as "you" when relevant.
+- If the user asked a question via prompt, answer it directly and concisely.
 
 EDGE CASES:
-- Blank/dark/unreadable frame: return ONE 'info' overlay { label: "Vision Unclear", detail: "Frame too dark or covered" } centered, spokenReply: "Vision is unclear — point the lens at something I can see."
+- Blank/dark/unreadable frame: return ONE 'info' overlay { label: "Vision Unclear", detail: "Frame too dark or covered" } centered, spokenReply: "Vision is unclear — point the lens at something."
 - Camera covered: same as above.
+- DO NOT just say "Environment detected" — always describe WHAT is in the environment specifically.
 
 ABSOLUTE RULES:
 - Never apologize. Never refuse. Never explain that you are an AI or a model.
-- NEVER include markdown, code fences, comments, or any text outside the JSON object.`;
+- NEVER include markdown, code fences, comments, or any text outside the JSON object.
+- NEVER use generic phrases like "Environment detected" or "Scene captured". Be SPECIFIC about what you see.`;
 
 const DETECTION_AND_TEXT_APPENDIX = `
 UPDATED DETECTION RULES:
-- Return at most 4 overlays. Pick the most useful visible boxes: hazards first, then readable text/questions, then people, then salient objects.
-- Bounding boxes must be visible whenever objects/text come into view. Do not omit boxes for prominent objects just because speech is empty.
-- Do not return duplicate boxes for the same item. Prefer 3-4 high-signal boxes over many weak ones.
+- Return at most 6 overlays. Pick the most useful visible boxes: hazards first, then readable text/questions, then people, then salient objects.
+- Bounding boxes must be visible whenever objects/text come into view. Do not omit boxes for prominent objects.
+- Do not return duplicate boxes for the same item. Prefer 4-6 high-signal boxes over many weak ones.
+- CRITICAL: Each bounding box must TIGHTLY FIT the actual object. Measure position carefully:
+  - x, y = center of the object as fraction of image (0-1)
+  - w, h = actual width and height of the object as fraction of image (0-1)
+  - Objects on the left side of the image should have x < 0.4
+  - Objects on the right side should have x > 0.6
+  - Objects at the top should have y < 0.4
+  - Objects at the bottom should have y > 0.6
+  - Small objects should have small w and h (0.06-0.15)
+  - Large objects should have larger w and h (0.2-0.45)
 
 UPDATED TEXT RULES:
 - If visible text is a question, worksheet, prompt, or form field, answer it directly in spokenReply.
@@ -235,17 +253,40 @@ function buildFallbackOverlays(args: {
     if (labels.length >= MAX_RETURNED_OVERLAYS) break;
   }
 
-  const fallbackLabels = labels.length > 0 ? labels : ["scene"];
+  // If no objects found from the label list, try to extract from context
+  if (labels.length === 0 && extractedContext.length > 10) {
+    // Return a generic "scene" overlay with the context as detail
+    return [{
+      id: "ov-scene-1",
+      kind: "info",
+      label: "Scene",
+      detail: extractedContext.slice(0, 60),
+      severity: "low",
+      x: 0.5,
+      y: 0.5,
+      w: 0.4,
+      h: 0.3,
+    }];
+  }
 
-  return fallbackLabels.slice(0, MAX_RETURNED_OVERLAYS).map((label, index) => {
-    const slot = FALLBACK_BOX_SLOTS[index] ?? FALLBACK_BOX_SLOTS[0];
+  // Distribute boxes across the frame instead of fixed slots
+  return labels.slice(0, MAX_RETURNED_OVERLAYS).map((label, index) => {
+    const columns = Math.min(labels.length, 3);
+    const col = index % columns;
+    const row = Math.floor(index / columns);
+    const xBase = 0.2 + (col * 0.3);
+    const yBase = 0.35 + (row * 0.3);
+
     return {
       id: `ov-fallback-${index + 1}`,
       kind: label === "person" ? "person" : "object",
       label: titleCase(label === "tv" ? "TV" : label),
-      detail: index === 0 ? "Detected" : undefined,
+      detail: `Detected in scene`,
       severity: "low",
-      ...slot,
+      x: Math.min(Math.max(xBase, 0.1), 0.9),
+      y: Math.min(Math.max(yBase, 0.15), 0.85),
+      w: 0.18,
+      h: 0.22,
     };
   });
 }
@@ -380,8 +421,6 @@ export async function analyzeFrame(args: {
 
   try {
     // 1. Router: Determine if Environment or Text-heavy.
-    // Explicit user text requests force OCR; otherwise monitor/scan still route
-    // because visible text may need answering or summarizing.
     const lowerPrompt = (prompt ?? "").toLowerCase();
     const isExplicitText =
       lowerPrompt.includes("read") ||
@@ -422,14 +461,17 @@ export async function analyzeFrame(args: {
         ], apiKey, log, { maxTokens: 1024, temp: 0.1, timeoutMs: 8000 });
       } else {
         log.info(`Step 2: Analyzing environment using ${NIM_COSMOS_MODEL} (8s timeout)...`);
-        const cosmosInstruction = "Describe this scene, objects, and any potential hazards in detail.";
+        const cosmosInstruction = "Describe this scene in detail. List every identifiable object, person, furniture, and item you can see, with their approximate position (left, center, right, foreground, background). Note any text, signs, screens, or labels visible. Describe colors, materials, and states of objects.";
         extractedContext = await callNimChat(NIM_COSMOS_MODEL, [
           { role: "user", content: `${cosmosInstruction}\n\n<img src="${dataUrl}" />` }
         ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 8000 });
       }
     } catch (err) {
       log.warn({ err }, "Extractor failed or timed out, using fallback context");
-      extractedContext = isTextHeavy ? "Unable to read text." : "Environment detected.";
+      // Better fallback than "Environment detected" — describe what we can
+      extractedContext = isTextHeavy
+        ? "Unable to read text clearly."
+        : "Scene analysis timed out. Objects may be present but could not be identified in time.";
     }
 
     // 3. Reasoner: Generate final JSON using Multimodal Reasoning
@@ -443,8 +485,9 @@ export async function analyzeFrame(args: {
         `Context extracted from vision: "${extractedContext}"`,
         isTextHeavy
           ? "Text was detected. If it is a question, answer it; if it is a long paragraph, summarize it; also box the text region."
-          : "Environment was detected. Box the most important 3-4 objects, people, hazards, or cues.",
-        "Based on the image and the context above, return the JSON object with precise bounding boxes.",
+          : "Environment was detected. Box the most important 3-6 objects, people, hazards, or cues. Be SPECIFIC about each item — include useful details like color, state, brand, material in the detail field.",
+        "Based on the image and the context above, return the JSON object with precise bounding boxes that TIGHTLY FIT each object.",
+        "IMPORTANT: Do NOT use generic summaries like 'Environment detected'. Describe what you ACTUALLY see.",
       ].join("\n");
 
       // We MUST send the image again so the reasoner can determine coordinates
@@ -458,11 +501,19 @@ export async function analyzeFrame(args: {
 
       const overlays = topOverlays(overlaysRaw.slice(0, 12).map(normalizeOverlay));
 
+      // Ensure sceneSummary is never generic
+      let sceneSummary = typeof parsed.sceneSummary === "string" && parsed.sceneSummary.length > 0
+        ? parsed.sceneSummary.slice(0, 140)
+        : "Scene captured.";
+      
+      // Block generic summaries
+      const genericPhrases = ["environment detected", "scene captured", "nothing notable"];
+      if (genericPhrases.some(p => sceneSummary.toLowerCase().includes(p)) && extractedContext.length > 20) {
+        sceneSummary = extractedContext.slice(0, 100);
+      }
+
       return {
-        sceneSummary:
-          typeof parsed.sceneSummary === "string" && parsed.sceneSummary.length > 0
-            ? parsed.sceneSummary.slice(0, 140)
-            : "Scene captured.",
+        sceneSummary,
         spokenReply:
           typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
         primaryFocus:
@@ -485,8 +536,15 @@ export async function analyzeFrame(args: {
         }
       }
 
+      // Better fallback summary
+      const fallbackSummary = isTextHeavy
+        ? "Text captured — reading content."
+        : extractedContext.length > 20
+          ? extractedContext.slice(0, 80)
+          : "Analyzing scene...";
+
       return {
-        sceneSummary: isTextHeavy ? "Text captured." : "Environment scan complete.",
+        sceneSummary: fallbackSummary,
         spokenReply,
         primaryFocus: isTextHeavy ? "text" : "environment",
         overlays: buildFallbackOverlays({ isTextHeavy, extractedContext }),

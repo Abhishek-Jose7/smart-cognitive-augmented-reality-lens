@@ -10,7 +10,8 @@ import { useAnalyzeScene } from '@workspace/api-client-react';
 import type { Overlay } from '@workspace/api-client-react';
 
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const AUTO_INTERVAL_MS = 6000;
+const AUTO_INTERVAL_MS = 4000;
+const WAKE_WORD = 'hey friday';
 
 export function HUD() {
   const [latestFrame, setLatestFrame] = useState<string | null>(null);
@@ -18,7 +19,13 @@ export function HUD() {
   const [showUploader, setShowUploader] = useState(false);
 
   const [isFrontCamera, setIsFrontCamera] = useState(false);
-  const [overlays, setOverlays] = useState<Overlay[]>([]);
+  // API overlays (from server analysis — rich context)
+  const [apiOverlays, setApiOverlays] = useState<Overlay[]>([]);
+  // Local detections (from COCO-SSD — instant, continuous)
+  const [localOverlays, setLocalOverlays] = useState<Overlay[]>([]);
+  // Scene analysis text that appears as overlay instead of being spoken
+  const [sceneText, setSceneText] = useState<string>('');
+  const [sceneSummary, setSceneSummary] = useState<string>('');
 
   const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'analyzing' | 'speaking'>('idle');
   const [isVoiceMuted, setIsVoiceMuted] = useState(false);
@@ -30,6 +37,8 @@ export function HUD() {
   const recognitionRef = useRef<any>(null);
   const latestFrameRef = useRef<string | null>(null);
   const lastAnalyzeAtRef = useRef<number>(0);
+  // Track whether the user used the wake word
+  const pendingWakeWordPromptRef = useRef<string | null>(null);
 
   useEffect(() => {
     latestFrameRef.current = latestFrame;
@@ -53,6 +62,7 @@ export function HUD() {
     };
   }, []);
 
+  // Speech recognition — only listens for "hey friday" wake word
   useEffect(() => {
     if (!SpeechRecognition || isVoiceMuted) {
       if (recognitionRef.current) {
@@ -75,7 +85,19 @@ export function HUD() {
     recognition.onresult = (event: any) => {
       const transcript = event.results[event.results.length - 1][0].transcript;
       if (transcript && transcript.trim().length > 0) {
-        triggerAnalyze(transcript);
+        const text = transcript.trim().toLowerCase();
+        // Only trigger voice response when wake word is detected
+        if (text.startsWith(WAKE_WORD) || text.startsWith('hey friday') || text.startsWith('hey, friday')) {
+          // Extract the message after the wake word
+          const message = text
+            .replace(/^hey,?\s*friday\s*/i, '')
+            .trim();
+          if (message.length > 0) {
+            pendingWakeWordPromptRef.current = message;
+            triggerAnalyze(message, true);
+          }
+        }
+        // All other speech is ignored — no audio response
       }
     };
 
@@ -99,7 +121,11 @@ export function HUD() {
     setLatestFrame(base64);
   }, []);
 
-  const triggerAnalyze = (prompt?: string) => {
+  const handleLocalDetections = useCallback((detections: Overlay[]) => {
+    setLocalOverlays(detections);
+  }, []);
+
+  const triggerAnalyze = (prompt?: string, speakResponse = false) => {
     const frame = latestFrameRef.current;
     if (!frame) {
       if (!fallbackImage) setShowUploader(true);
@@ -121,13 +147,21 @@ export function HUD() {
       },
       {
         onSuccess: (data) => {
-          setOverlays(data.overlays || []);
+          setApiOverlays(data.overlays || []);
 
-          // Server now returns "" when nothing useful to say. Trust it: speak whenever the
-          // model gave us a non-empty spokenReply (it has already filtered for hazards,
-          // text/Q&A, reminders, or direct user prompts).
+          // Always show analysis as text overlay
           const reply = (data.spokenReply || '').trim();
-          const shouldSpeak = !!reply && !isVoiceMuted;
+          const summary = (data.sceneSummary || '').trim();
+
+          if (reply) {
+            setSceneText(reply);
+          }
+          if (summary) {
+            setSceneSummary(summary);
+          }
+
+          // Only speak aloud if wake word was used
+          const shouldSpeak = speakResponse && !!reply && !isVoiceMuted;
 
           if (shouldSpeak && window.speechSynthesis) {
             setVoiceState('speaking');
@@ -150,10 +184,13 @@ export function HUD() {
           } else {
             setVoiceState(isVoiceMuted ? 'idle' : 'listening');
           }
+
+          pendingWakeWordPromptRef.current = null;
         },
         onError: (err) => {
           console.error('[SCARL] API error:', err);
-          setOverlays([{
+          setSceneText(err instanceof Error ? err.message.slice(0, 60) : 'API request failed');
+          setApiOverlays([{
             id: 'error-overlay',
             kind: 'warning',
             label: 'API Error',
@@ -170,28 +207,68 @@ export function HUD() {
     );
   };
 
-  // Event-based monitoring trigger
+  // Auto-analyze at intervals (no voice response — text overlays only)
   useEffect(() => {
     if (!autoMode) return;
     if (analyzeScene.isPending) return;
     if (voiceState === 'speaking') return;
     
-    // Throttle repeated calls (e.g. max 1 request every AUTO_INTERVAL_MS - 500)
-    // Wait, since we want to be responsive to motion, we could reduce the timeout
-    // but the instruction says "throttle requests, queue, debounce repeated calls".
     if (Date.now() - lastAnalyzeAtRef.current < AUTO_INTERVAL_MS - 500) return;
     if (!latestFrameRef.current) return;
     
-    triggerAnalyze();
+    // Never speak for auto-analysis, only text overlay
+    triggerAnalyze(undefined, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [latestFrame, autoMode, voiceState, analyzeScene.isPending]);
 
   const handleToggleAuto = () => setAutoMode((v) => !v);
 
+  // Merge local detections with API overlays.
+  // Local detections are shown immediately and continuously.
+  // API overlays are enriched (have detail, kind, etc) but slower.
+  const mergedOverlays = React.useMemo(() => {
+    const apiMap = new Map<string, Overlay>();
+    for (const o of apiOverlays) {
+      apiMap.set(o.label.toLowerCase(), o);
+    }
+
+    const merged: Overlay[] = [];
+    const usedApiLabels = new Set<string>();
+
+    // Start with local detections — they have accurate bounding boxes
+    for (const local of localOverlays) {
+      const labelKey = local.label.toLowerCase();
+      const apiMatch = apiMap.get(labelKey);
+      if (apiMatch) {
+        // Use local bbox + API detail/kind enrichment
+        merged.push({
+          ...local,
+          kind: apiMatch.kind || local.kind,
+          detail: apiMatch.detail || local.detail,
+          severity: apiMatch.severity || local.severity,
+        });
+        usedApiLabels.add(labelKey);
+      } else {
+        merged.push(local);
+      }
+    }
+
+    // Add any API-only overlays (text, warnings, suggestions, etc.)
+    for (const api of apiOverlays) {
+      const labelKey = api.label.toLowerCase();
+      if (!usedApiLabels.has(labelKey)) {
+        merged.push(api);
+      }
+    }
+
+    return merged;
+  }, [localOverlays, apiOverlays]);
+
   return (
     <div className="relative w-full h-[100dvh] bg-black text-white overflow-hidden font-sans selection:bg-transparent">
       <CameraStage
         onFrameCapture={handleFrameCapture}
+        onLocalDetections={handleLocalDetections}
         isFrontCamera={isFrontCamera}
         fallbackImage={fallbackImage}
       />
@@ -210,10 +287,45 @@ export function HUD() {
       <StatusStrip autoMode={autoMode} />
 
       {/* Top-right: contextual insights only when relevant */}
-      <InsightPanel overlays={overlays} />
+      <InsightPanel overlays={mergedOverlays} />
 
-      {/* Bounding boxes & labels */}
-      <OverlayLayer overlays={overlays} autoMode={autoMode} />
+      {/* Bounding boxes & labels — uses merged local+API overlays */}
+      <OverlayLayer overlays={mergedOverlays} autoMode={autoMode} />
+
+      {/* Scene analysis text overlay — shown instead of spoken */}
+      {(sceneText || sceneSummary) && (
+        <div className="absolute bottom-14 left-1/2 -translate-x-1/2 z-30 pointer-events-none max-w-[80vw]">
+          <div
+            className="px-3 py-2 rounded-sm"
+            style={{
+              background: 'rgba(0,0,0,0.65)',
+              backdropFilter: 'blur(4px)',
+              border: '1px solid rgba(92, 246, 255, 0.25)',
+              boxShadow: '0 0 12px rgba(92, 246, 255, 0.08)',
+            }}
+          >
+            {sceneSummary && (
+              <div
+                className="text-[9px] text-white/50 tracking-widest mb-0.5"
+                style={{ fontVariantCaps: 'all-small-caps', letterSpacing: '0.12em' }}
+              >
+                {sceneSummary}
+              </div>
+            )}
+            {sceneText && (
+              <div
+                className="text-[11px] text-[rgba(180,240,255,0.92)] leading-tight"
+                style={{
+                  textShadow: '0 1px 2px rgba(0,0,0,0.9)',
+                  letterSpacing: '0.04em',
+                }}
+              >
+                {sceneText}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Bottom-right: tiny controls */}
       <SecondaryControls

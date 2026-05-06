@@ -12,18 +12,19 @@ interface TrackedOverlay extends Overlay {
   _key: string;
   _firstSeenAt: number;
   _lastSeenAt: number;
-  _hideAt: number; // timestamp when this should disappear from view
+  _hideAt: number;
 }
 
 const ALWAYS_SHOW_KINDS = new Set(['warning', 'threat', 'navigation', 'text', 'reminder', 'suggestion']);
 const HIGH_SEVERITIES = new Set(['high', 'critical']);
-const MAX_VISIBLE_OVERLAYS = 4;
+const MAX_VISIBLE_OVERLAYS = 8;
 
-// How long a label stays visible after first/last appearance.
-// Important things linger longer; mundane objects fade fast.
-const NEW_OBJECT_DISPLAY_MS = 7000;
-const KNOWN_OBJECT_DISPLAY_MS = 7000;
-const IMPORTANT_DISPLAY_MS = 9000;
+// Longer display times for continuous HUD feel
+const NEW_OBJECT_DISPLAY_MS = 12000;
+const KNOWN_OBJECT_DISPLAY_MS = 8000;
+const IMPORTANT_DISPLAY_MS = 15000;
+// Local detection boxes refresh continuously, so they stay visible
+const LOCAL_DISPLAY_MS = 2000;
 
 function fingerprint(o: Overlay): string {
   return `${(o.kind || 'object').toLowerCase()}::${(o.label || '').toLowerCase().trim()}`;
@@ -35,6 +36,10 @@ function detailFingerprint(o: Overlay): string {
 
 function isImportant(o: Overlay): boolean {
   return ALWAYS_SHOW_KINDS.has((o.kind || '').toLowerCase()) || HIGH_SEVERITIES.has((o.severity || '').toLowerCase());
+}
+
+function isLocalDetection(o: Overlay): boolean {
+  return o.id.startsWith('local-');
 }
 
 function overlayScore(o: Overlay): number {
@@ -90,17 +95,20 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
         const knownDetailFp = knownRef.current.get(key)?.detailFp;
         const detailChanged = wasKnown && knownDetailFp !== detailFingerprint(o);
         const important = isImportant(o);
+        const local = isLocalDetection(o);
         const existingTracked = prevByKey.get(key);
 
-        // Decide whether to surface this box right now
         let shouldSurface = false;
         let displayMs = KNOWN_OBJECT_DISPLAY_MS;
 
-        if (!wasKnown) {
+        if (local) {
+          // Local detections: always surface, short timeout since they refresh continuously
+          shouldSurface = true;
+          displayMs = LOCAL_DISPLAY_MS;
+        } else if (!wasKnown) {
           shouldSurface = true;
           displayMs = NEW_OBJECT_DISPLAY_MS;
         } else if (incomingByKey.has(key)) {
-          // Keep boxes visible while the object/text is still in the current analysis.
           shouldSurface = true;
           displayMs = important ? IMPORTANT_DISPLAY_MS : KNOWN_OBJECT_DISPLAY_MS;
         } else if (important) {
@@ -113,15 +121,23 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
           shouldSurface = true;
           displayMs = NEW_OBJECT_DISPLAY_MS;
         } else if (existingTracked && existingTracked._hideAt > now) {
-          // It's still within its display window from an earlier surfacing — keep showing
           shouldSurface = true;
           displayMs = Math.max(0, existingTracked._hideAt - now);
         }
 
         if (shouldSurface) {
           const firstSeenAt = existingTracked?._firstSeenAt ?? now;
+          // For local detections, smoothly update position from existing tracked
+          const smoothed = local && existingTracked ? {
+            x: lerp(existingTracked.x ?? 0.5, o.x ?? 0.5, 0.4),
+            y: lerp(existingTracked.y ?? 0.5, o.y ?? 0.5, 0.4),
+            w: lerp(existingTracked.w ?? 0.2, o.w ?? 0.2, 0.3),
+            h: lerp(existingTracked.h ?? 0.2, o.h ?? 0.2, 0.3),
+          } : {};
+
           next.push({
             ...o,
+            ...smoothed,
             _key: key,
             _firstSeenAt: firstSeenAt,
             _lastSeenAt: now,
@@ -153,7 +169,7 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
         const filtered = limitVisible(prev.filter((p) => p._hideAt > now));
         return filtered.length === prev.length ? prev : filtered;
       });
-    }, 500);
+    }, 400);
     return () => clearInterval(id);
   }, []);
 
@@ -166,4 +182,8 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
       </AnimatePresence>
     </div>
   );
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }

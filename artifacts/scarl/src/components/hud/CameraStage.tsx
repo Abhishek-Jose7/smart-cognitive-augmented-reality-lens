@@ -1,18 +1,123 @@
 import React, { useRef, useEffect } from 'react';
+import type { Overlay } from '@workspace/api-client-react';
 
 interface CameraStageProps {
   onFrameCapture: (base64: string) => void;
+  onLocalDetections: (overlays: Overlay[]) => void;
   isFrontCamera: boolean;
   fallbackImage: string | null;
 }
 
-export function CameraStage({ onFrameCapture, isFrontCamera, fallbackImage }: CameraStageProps) {
+type CocoModel = {
+  detect: (input: HTMLVideoElement) => Promise<Array<{
+    bbox: [number, number, number, number];
+    class: string;
+    score: number;
+  }>>;
+};
+
+// Much faster detection for continuous real-time bounding
+const LOCAL_DETECTION_INTERVAL_MS = 350;
+const LOCAL_DETECTION_SCORE = 0.45;
+const LOCAL_DETECTION_MAX = 8;
+
+const LABEL_MAP: Record<string, string> = {
+  tv: 'TV',
+  laptop: 'Laptop',
+  'cell phone': 'Phone',
+  'potted plant': 'Plant',
+  'dining table': 'Table',
+  couch: 'Sofa',
+  chair: 'Chair',
+  person: 'Person',
+  keyboard: 'Keyboard',
+  mouse: 'Mouse',
+  book: 'Book',
+  cup: 'Cup',
+  bottle: 'Bottle',
+  clock: 'Clock',
+  vase: 'Vase',
+  scissors: 'Scissors',
+  remote: 'Remote',
+  microwave: 'Microwave',
+  oven: 'Oven',
+  toaster: 'Toaster',
+  refrigerator: 'Fridge',
+  sink: 'Sink',
+  car: 'Car',
+  bicycle: 'Bicycle',
+  dog: 'Dog',
+  cat: 'Cat',
+  backpack: 'Backpack',
+  handbag: 'Handbag',
+  umbrella: 'Umbrella',
+  tie: 'Tie',
+  suitcase: 'Suitcase',
+  bowl: 'Bowl',
+  banana: 'Banana',
+  apple: 'Apple',
+  sandwich: 'Sandwich',
+  pizza: 'Pizza',
+  donut: 'Donut',
+  cake: 'Cake',
+  bed: 'Bed',
+  toilet: 'Toilet',
+};
+
+function labelFor(className: string) {
+  return LABEL_MAP[className] ?? className
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function mapVideoBoxToViewport(
+  video: HTMLVideoElement,
+  bbox: [number, number, number, number],
+) {
+  const [bx, by, bw, bh] = bbox;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const cw = video.clientWidth;
+  const ch = video.clientHeight;
+
+  if (!vw || !vh || !cw || !ch) return null;
+
+  const scale = Math.max(cw / vw, ch / vh);
+  const renderedW = vw * scale;
+  const renderedH = vh * scale;
+  const offsetX = (cw - renderedW) / 2;
+  const offsetY = (ch - renderedH) / 2;
+
+  const left = (bx * scale + offsetX) / cw;
+  const top = (by * scale + offsetY) / ch;
+  const width = (bw * scale) / cw;
+  const height = (bh * scale) / ch;
+
+  const x = left + width / 2;
+  const y = top + height / 2;
+
+  if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) return null;
+
+  return {
+    x: Math.min(Math.max(x, 0), 1),
+    y: Math.min(Math.max(y, 0), 1),
+    w: Math.min(Math.max(width, 0.04), 0.85),
+    h: Math.min(Math.max(height, 0.04), 0.85),
+  };
+}
+
+export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, fallbackImage }: CameraStageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const detectorRef = useRef<CocoModel | null>(null);
 
   useEffect(() => {
     let stream: MediaStream | null = null;
-    if (fallbackImage) return;
+    if (fallbackImage) {
+      onLocalDetections([]);
+      return;
+    }
 
     async function startCamera() {
       try {
@@ -36,15 +141,97 @@ export function CameraStage({ onFrameCapture, isFrontCamera, fallbackImage }: Ca
     return () => {
       if (stream) stream.getTracks().forEach((track) => track.stop());
     };
-  }, [isFrontCamera, fallbackImage]);
+  }, [isFrontCamera, fallbackImage, onLocalDetections]);
 
+  // Local COCO-SSD detector — runs continuously for real-time bounding boxes
+  useEffect(() => {
+    let cancelled = false;
+    let running = false;
+    let rafId: number | undefined;
+    let lastDetectTime = 0;
+
+    async function loadDetector() {
+      try {
+        await import('@tensorflow/tfjs');
+        const coco = await import('@tensorflow-models/coco-ssd');
+        if (cancelled) return;
+        detectorRef.current = await coco.load({ base: 'lite_mobilenet_v2' }) as CocoModel;
+        // Start detection loop once model is loaded
+        scheduleDetection();
+      } catch (err) {
+        console.error('[SCARL] Local detector failed to load', err);
+      }
+    }
+
+    function scheduleDetection() {
+      if (cancelled) return;
+      rafId = requestAnimationFrame(detectLoop);
+    }
+
+    async function detectLoop(timestamp: number) {
+      if (cancelled) return;
+
+      // Throttle to our interval
+      if (timestamp - lastDetectTime >= LOCAL_DETECTION_INTERVAL_MS && !running) {
+        lastDetectTime = timestamp;
+        await detect();
+      }
+
+      scheduleDetection();
+    }
+
+    async function detect() {
+      const video = videoRef.current;
+      const detector = detectorRef.current;
+      if (!video || !detector || fallbackImage || running) return;
+      if (video.readyState < video.HAVE_ENOUGH_DATA) return;
+
+      running = true;
+      try {
+        const predictions = await detector.detect(video);
+        const overlays = predictions
+          .filter((p) => p.score >= LOCAL_DETECTION_SCORE)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, LOCAL_DETECTION_MAX)
+          .map((p, index): Overlay | null => {
+            const box = mapVideoBoxToViewport(video, p.bbox);
+            if (!box) return null;
+            const label = labelFor(p.class);
+            return {
+              id: `local-${p.class}-${index}`,
+              kind: p.class === 'person' ? 'person' : 'object',
+              label,
+              detail: `${Math.round(p.score * 100)}%`,
+              severity: 'low',
+              ...box,
+            };
+          })
+          .filter((o): o is Overlay => Boolean(o));
+
+        onLocalDetections(overlays);
+      } catch (err) {
+        console.warn('[SCARL] Local detection failed', err);
+      } finally {
+        running = false;
+      }
+    }
+
+    loadDetector();
+
+    return () => {
+      cancelled = true;
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [fallbackImage, onLocalDetections]);
+
+  // Frame capture for API analysis (separate from local detection)
   const motionCanvasRef = useRef<HTMLCanvasElement>(null);
   const prevImageDataRef = useRef<Uint8ClampedArray | null>(null);
 
   useEffect(() => {
     const MOTION_W = 64;
     const MOTION_H = 64;
-    const MSE_THRESHOLD = 800; // Mean squared error threshold for motion
+    const MSE_THRESHOLD = 600; // Lowered for faster responsiveness
 
     const captureInterval = setInterval(() => {
       if (!videoRef.current || !canvasRef.current || fallbackImage) return;
@@ -67,7 +254,6 @@ export function CameraStage({ onFrameCapture, isFrontCamera, fallbackImage }: Ca
             
             if (prevData) {
               let diff = 0;
-              // Only check one channel (red) for speed, assuming luma is roughly correlated
               for (let i = 0; i < currentData.length; i += 4) {
                 const diffR = currentData[i] - prevData[i];
                 diff += (diffR * diffR);
@@ -85,10 +271,9 @@ export function CameraStage({ onFrameCapture, isFrontCamera, fallbackImage }: Ca
           }
         }
 
-        // 2. Only capture and bubble up if motion detected
-        if (hasMotion) {
-          // Downscale to keep base64 payload comfortably under NIM's inline limit
-          // (~180KB). Vision model accuracy holds up well at 720px wide.
+        // 2. Always capture on interval for API (even without motion, to keep analysis fresh)
+        // But prioritize motion frames
+        if (hasMotion || !prevImageDataRef.current) {
           const MAX_W = 720;
           const ratio = video.videoWidth > MAX_W ? MAX_W / video.videoWidth : 1;
           canvas.width = Math.round(video.videoWidth * ratio);
@@ -102,7 +287,7 @@ export function CameraStage({ onFrameCapture, isFrontCamera, fallbackImage }: Ca
           }
         }
       }
-    }, 1000);
+    }, 800);
     return () => clearInterval(captureInterval);
   }, [onFrameCapture, fallbackImage]);
 
