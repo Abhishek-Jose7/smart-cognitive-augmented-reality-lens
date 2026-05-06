@@ -3,9 +3,11 @@ import { setBaseUrl } from "@workspace/api-client-react";
 import App from "./App";
 import "./index.css";
 
-// Configure API base URL if provided in env
-if (import.meta.env.VITE_API_URL) {
-  setBaseUrl(import.meta.env.VITE_API_URL);
+const apiBaseUrl =
+  import.meta.env.VITE_SCARL_API_URL ?? import.meta.env.VITE_API_URL;
+
+if (apiBaseUrl) {
+  setBaseUrl(apiBaseUrl);
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

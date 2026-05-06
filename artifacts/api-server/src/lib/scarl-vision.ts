@@ -28,6 +28,7 @@ const NIM_MODEL =
 // upload to their assets endpoint, which is overkill for our use case — we just
 // trim instead. Frontend already JPEG-compresses at quality 0.7.
 const MAX_INLINE_IMAGE_BYTES = 180_000;
+const MAX_RETURNED_OVERLAYS = 4;
 
 const SYSTEM_PROMPT = `You are Scarl — a Smart Cognitive Augmented Reality Lens — the AI inside a pair of wearable smart glasses worn by the user. You receive a single still frame from the user's field of view (landscape) and respond like a professional, calm assistant. Your job is to keep the user's view clear and only surface what matters.
 
@@ -51,7 +52,7 @@ Return STRICT JSON ONLY (no prose, no markdown fences, no comments) with this ex
 
 OVERLAY RULES — keep view UNCLUTTERED:
 - Box ONLY salient identifiable items. Skip background fill, generic ground, walls, sky, duplicates, tiny irrelevant trinkets.
-- Return 3 to 8 overlays. Fewer is better. Empty list is fine if there's truly nothing notable.
+- Return 1 to 4 overlays. Prefer the most useful visible things. Empty list is fine if there's truly nothing notable.
 - Each overlay = one tightly-fit box around ONE thing. Coordinates normalized [0,1], (0,0) top-left, x/y are CENTER.
 - 'label' = short noun ("Laptop", "Mug", "Door", "Person", "Plant"). No all-caps, no exclamation, max 2 words.
 - 'detail' is OPTIONAL — include only when useful: a quoted reading of visible text, a state ("Open", "Half full", "Plugged in"), a hazard reason ("Hot — steam visible"). Max 50 chars. Omit otherwise.
@@ -86,6 +87,19 @@ EDGE CASES:
 ABSOLUTE RULES:
 - Never apologize. Never refuse. Never explain that you are an AI or a model.
 - NEVER include markdown, code fences, comments, or any text outside the JSON object.`;
+
+const DETECTION_AND_TEXT_APPENDIX = `
+UPDATED DETECTION RULES:
+- Return at most 4 overlays. Pick the most useful visible boxes: hazards first, then readable text/questions, then people, then salient objects.
+- Bounding boxes must be visible whenever objects/text come into view. Do not omit boxes for prominent objects just because speech is empty.
+- Do not return duplicate boxes for the same item. Prefer 3-4 high-signal boxes over many weak ones.
+
+UPDATED TEXT RULES:
+- If visible text is a question, worksheet, prompt, or form field, answer it directly in spokenReply.
+- If visible text is a big paragraph, page, article, note, email, or notice, summarize the main point in spokenReply.
+- If visible text is short signage, read or interpret it briefly.
+- Always include a text overlay around the readable text region when text drives the answer.
+- The whole purpose is detection, analysis, and answer: identify what matters, analyze it, and answer the user's likely need.`;
 
 function tryParseJson(raw: string): unknown {
   const trimmed = raw.trim();
@@ -122,6 +136,38 @@ function normalizeOverlay(raw: unknown, idx: number): VisionOverlay {
     w: clamp01(o.w, 0.2),
     h: clamp01(o.h, 0.2),
   };
+}
+
+function overlayPriority(o: VisionOverlay): number {
+  const kind = (o.kind || "object").toLowerCase();
+  const severity = (o.severity || "low").toLowerCase();
+  let score = 0;
+  if (severity === "critical") score += 100;
+  if (severity === "high") score += 80;
+  if (severity === "medium") score += 30;
+  if (kind === "threat") score += 100;
+  if (kind === "warning") score += 80;
+  if (kind === "text") score += 70;
+  if (kind === "navigation") score += 60;
+  if (kind === "person") score += 45;
+  if (kind === "suggestion" || kind === "reminder") score += 40;
+  if (o.detail) score += 8;
+  const area = Math.max(0, o.w ?? 0) * Math.max(0, o.h ?? 0);
+  return score + Math.min(area * 20, 10);
+}
+
+function topOverlays(overlays: VisionOverlay[]): VisionOverlay[] {
+  const seen = new Set<string>();
+  return overlays
+    .filter((overlay) => {
+      const key = `${overlay.kind}:${overlay.label}:${Math.round((overlay.x ?? 0) * 10)}:${Math.round((overlay.y ?? 0) * 10)}`.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => overlayPriority(b) - overlayPriority(a))
+    .slice(0, MAX_RETURNED_OVERLAYS)
+    .map((overlay, index) => ({ ...overlay, id: overlay.id || `ov-${index + 1}` }));
 }
 
 function fallbackResult(reason: string): VisionResult {
@@ -229,18 +275,24 @@ export async function analyzeFrame(args: {
   const dataUrl = `data:${mimeType};base64,${imageBase64}`;
 
   try {
-    // 1. Router: Determine if Environment or Text-heavy
-    // Bypass router if hints are present in prompt or mode
+    // 1. Router: Determine if Environment or Text-heavy.
+    // Explicit user text requests force OCR; otherwise monitor/scan still route
+    // because visible text may need answering or summarizing.
     const lowerPrompt = (prompt ?? "").toLowerCase();
-    const isExplicitText = lowerPrompt.includes("read") || lowerPrompt.includes("text") || lowerPrompt.includes("say");
-    const isExplicitScan = mode === "scan" || mode === "monitor";
+    const isExplicitText =
+      lowerPrompt.includes("read") ||
+      lowerPrompt.includes("text") ||
+      lowerPrompt.includes("say") ||
+      lowerPrompt.includes("question") ||
+      lowerPrompt.includes("answer") ||
+      lowerPrompt.includes("summarize");
 
-    let isTextHeavy = isExplicitText && !isExplicitScan;
+    let isTextHeavy = isExplicitText;
     
-    if (!isExplicitText && !isExplicitScan) {
+    if (!isExplicitText) {
       try {
         log.info("Step 1: Routing image content (2s timeout)...");
-        const routerInstruction = "Respond with EXACTLY ONE WORD: 'TEXT' if this image is primarily a document, screen, or text-heavy. Otherwise respond with 'ENVIRONMENT'.";
+        const routerInstruction = "Respond with EXACTLY ONE WORD: 'TEXT' if this image contains a readable question, worksheet, document, screen, sign, paragraph, page, or other prominent text. Otherwise respond with 'ENVIRONMENT'.";
         const routerRes = await callNimChat(NIM_ROUTER_MODEL, [
           { role: "user", content: `${routerInstruction}\n\n<img src="${dataUrl}" />` }
         ], apiKey, log, { maxTokens: 5, temp: 0.1, timeoutMs: 2000 });
@@ -252,7 +304,7 @@ export async function analyzeFrame(args: {
         isTextHeavy = false;
       }
     } else {
-      log.info({ isTextHeavy, mode, prompt }, "Router bypassed via hints");
+      log.info({ isTextHeavy, mode, prompt }, "Router forced by text prompt");
     }
 
     // 2. Extractor: Cosmos for Environment, OCR for Text
@@ -285,12 +337,15 @@ export async function analyzeFrame(args: {
           ? `User said: "${prompt}". Treat this as a direct question — answer it concisely in spokenReply.`
           : "Standard ambient scan.",
         `Context extracted from vision: "${extractedContext}"`,
+        isTextHeavy
+          ? "Text was detected. If it is a question, answer it; if it is a long paragraph, summarize it; also box the text region."
+          : "Environment was detected. Box the most important 3-4 objects, people, hazards, or cues.",
         "Based on the image and the context above, return the JSON object with precise bounding boxes.",
       ].join("\n");
 
       // We MUST send the image again so the reasoner can determine coordinates
       const text = await callNimChat(NIM_REASONER_MODEL, [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: `${SYSTEM_PROMPT}\n\n${DETECTION_AND_TEXT_APPENDIX}` },
         { role: "user", content: `${userInstruction}\n\n<img src="${dataUrl}" />` }
       ], apiKey, log, { maxTokens: 1024, temp: 0.2, timeoutMs: 3000 });
 
@@ -306,7 +361,7 @@ export async function analyzeFrame(args: {
           typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
         primaryFocus:
           typeof parsed.primaryFocus === "string" ? parsed.primaryFocus : "scene",
-        overlays: overlaysRaw.slice(0, 12).map(normalizeOverlay),
+        overlays: topOverlays(overlaysRaw.slice(0, 12).map(normalizeOverlay)),
       };
     } catch (err) {
       log.warn({ err }, "Reasoner failed or timed out, using fallback JSON builder");

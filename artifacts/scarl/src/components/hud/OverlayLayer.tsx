@@ -17,6 +17,7 @@ interface TrackedOverlay extends Overlay {
 
 const ALWAYS_SHOW_KINDS = new Set(['warning', 'threat', 'navigation', 'text', 'reminder', 'suggestion']);
 const HIGH_SEVERITIES = new Set(['high', 'critical']);
+const MAX_VISIBLE_OVERLAYS = 4;
 
 // How long a label stays visible after first/last appearance.
 // Important things linger longer; mundane objects fade fast.
@@ -34,6 +35,33 @@ function detailFingerprint(o: Overlay): string {
 
 function isImportant(o: Overlay): boolean {
   return ALWAYS_SHOW_KINDS.has((o.kind || '').toLowerCase()) || HIGH_SEVERITIES.has((o.severity || '').toLowerCase());
+}
+
+function overlayScore(o: Overlay): number {
+  const kind = (o.kind || 'object').toLowerCase();
+  const severity = (o.severity || 'low').toLowerCase();
+  let score = 0;
+  if (severity === 'critical') score += 100;
+  if (severity === 'high') score += 80;
+  if (severity === 'medium') score += 30;
+  if (kind === 'threat') score += 100;
+  if (kind === 'warning') score += 80;
+  if (kind === 'text') score += 70;
+  if (kind === 'navigation') score += 60;
+  if (kind === 'person') score += 45;
+  if (kind === 'suggestion' || kind === 'reminder') score += 40;
+  if (o.detail) score += 8;
+  return score;
+}
+
+function limitVisible<T extends TrackedOverlay>(items: T[]): T[] {
+  return [...items]
+    .sort((a, b) => {
+      const priority = overlayScore(b) - overlayScore(a);
+      if (priority !== 0) return priority;
+      return b._lastSeenAt - a._lastSeenAt;
+    })
+    .slice(0, MAX_VISIBLE_OVERLAYS);
 }
 
 export function OverlayLayer({ overlays }: OverlayLayerProps) {
@@ -104,7 +132,7 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
         if (p._hideAt > now) next.push(p);
       });
 
-      return next;
+      return limitVisible(next);
     });
 
     // Update the "known" memory AFTER reconciling
@@ -118,7 +146,7 @@ export function OverlayLayer({ overlays }: OverlayLayerProps) {
     const id = setInterval(() => {
       const now = Date.now();
       setTracked((prev) => {
-        const filtered = prev.filter((p) => p._hideAt > now);
+        const filtered = limitVisible(prev.filter((p) => p._hideAt > now));
         return filtered.length === prev.length ? prev : filtered;
       });
     }, 500);
