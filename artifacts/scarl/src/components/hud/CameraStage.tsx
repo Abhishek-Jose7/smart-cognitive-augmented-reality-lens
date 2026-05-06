@@ -327,15 +327,23 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
         // Always capture at least the first frame, then on motion or every capture cycle
         if (hasMotion || !frameCapturedRef.current) {
           frameCapturedRef.current = true;
-          // Smaller image = faster upload + within NIM inline limit
-          const MAX_W = 480;
+          // Text analysis requires high resolution. We aim for 1280px but compress aggressively to stay under NIM 180KB inline limit.
+          const MAX_W = 1280;
           const ratio = video.videoWidth > MAX_W ? MAX_W / video.videoWidth : 1;
           canvas.width = Math.round(video.videoWidth * ratio);
           canvas.height = Math.round(video.videoHeight * ratio);
           const ctx = canvas.getContext('2d');
           if (ctx) {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.4);
+            
+            // Dynamic compression to stay under ~180KB base64 limit (approx 240,000 chars)
+            let quality = 0.8;
+            let dataUrl = canvas.toDataURL('image/jpeg', quality);
+            while (dataUrl.length > 230000 && quality > 0.1) {
+              quality -= 0.1;
+              dataUrl = canvas.toDataURL('image/jpeg', quality);
+            }
+            
             const base64 = dataUrl.split(',')[1];
             onFrameCapture(base64);
           }
