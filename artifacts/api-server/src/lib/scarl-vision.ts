@@ -152,70 +152,10 @@ function fallbackResult(reason: string): VisionResult {
         h: 0.12,
       },
     ],
-  };
-}
-
-async function callNimChat(
-  model: string,
-  messages: any[],
-  apiKey: string,
-  log: Logger,
-  options: { maxTokens?: number; temp?: number; timeoutMs?: number } = {}
-) {
-  const { maxTokens = 1024, temp = 0.2, timeoutMs = VISION_TIMEOUT_MS } = options;
-  
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const startTime = Date.now();
-    const response = await fetch(`${NIM_BASE_URL}/chat/completions`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: temp,
-        top_p: 0.9,
-        max_tokens: maxTokens,
-        stream: false,
-      }),
-    });
-
-    const elapsed = Date.now() - startTime;
-
-    if (!response.ok) {
-      const body = await response.text();
-      log.error({ status: response.status, body: body.slice(0, 500), model, elapsed }, "NIM error");
-      throw new Error(`NIM ${response.status} from ${model}`);
-    }
-
-    const json = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const text = json.choices?.[0]?.message?.content ?? "";
-    log.info({ model, elapsed, responseLength: text.length }, "NIM response received");
-    if (!text) {
-      throw new Error(`Empty response from model ${model}`);
-    }
-    return text;
-  } catch (err) {
-    if (err instanceof Error && err.name === "AbortError") {
-      throw new Error(`TIMEOUT: ${model} took >${timeoutMs}ms`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-/**
- * Single-step vision analysis.
- * Previous 3-step pipeline (router→extractor→reasoner) was too slow and kept timing out.
- * Now: one call to the vision model with a comprehensive prompt.
+  /**
+ * Two-step text-first vision analysis:
+ * 1. OCR.space for highly accurate text extraction.
+ * 2. Groq (Llama 3 8B) for blazing fast JSON formatting and summarization.
  */
 export async function analyzeFrame(args: {
   imageBase64: string;
@@ -226,64 +166,111 @@ export async function analyzeFrame(args: {
 }): Promise<VisionResult> {
   const { imageBase64, mimeType, prompt, mode, log } = args;
 
-  const apiKey = process.env["NVIDIA_NIM_API_KEY"];
-  if (!apiKey) {
-    log.error("Missing NVIDIA_NIM_API_KEY");
-    return fallbackResult("API key not configured.");
-  }
+  const ocrKey = process.env["OCR_SPACE_API_KEY"];
+  const groqKey = process.env["GROQ_API_KEY"];
 
-  if (imageBase64.length > MAX_INLINE_IMAGE_BYTES) {
-    log.warn(
-      { bytes: imageBase64.length },
-      "Image exceeds NIM inline limit",
-    );
-    return fallbackResult("Image too large for inline upload.");
+  if (!ocrKey || !groqKey) {
+    log.error("Missing OCR_SPACE_API_KEY or GROQ_API_KEY");
+    return fallbackResult("API keys not configured.");
   }
 
   const dataUrl = `data:${mimeType};base64,${imageBase64}`;
 
   try {
-    const userInstruction = [
-      `Mode: ${mode ?? "scan"}.`,
-      prompt
-        ? `User asked: "${prompt}". Answer this directly in spokenReply.`
-        : "Analyze this scene. Identify all notable objects, people, text, and hazards.",
-      "Return the JSON with bounding boxes tightly fitting each detected item.",
-      "If you see readable text, read it and include it in the detail field and answer any questions in spokenReply.",
-    ].join("\n");
+    log.info("Step 1: Extracting text via OCR.space...");
+    const ocrStartTime = Date.now();
+    const ocrFormData = new URLSearchParams();
+    ocrFormData.append("apikey", ocrKey);
+    ocrFormData.append("base64Image", dataUrl);
+    ocrFormData.append("OCREngine", "2");
 
-    log.info({ model: NIM_VISION_MODEL, timeout: VISION_TIMEOUT_MS }, "Single-step vision analysis starting...");
+    const ocrResponse = await fetch("https://api.ocr.space/parse/image", {
+      method: "POST",
+      body: ocrFormData,
+    });
 
-    const text = await callNimChat(NIM_VISION_MODEL, [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: `${userInstruction}\n\n<img src="${dataUrl}" />` }
-    ], apiKey, log, { maxTokens: 800, temp: 0.2, timeoutMs: VISION_TIMEOUT_MS });
+    if (!ocrResponse.ok) {
+      throw new Error(`OCR.space returned ${ocrResponse.status}`);
+    }
+
+    const ocrData = await ocrResponse.json() as any;
+    const extractedText = ocrData?.ParsedResults?.[0]?.ParsedText || "";
+    log.info({ elapsed: Date.now() - ocrStartTime, chars: extractedText.length }, "OCR.space finished");
+
+    log.info("Step 2: Processing via Groq...");
+    const groqStartTime = Date.now();
+    
+    let userMessage = `Mode: ${mode ?? "scan"}.`;
+    if (prompt) userMessage += `\nUser asked: "${prompt}".`;
+    
+    if (extractedText.trim().length > 0) {
+      userMessage += `\n\nI am looking at this text:\n"${extractedText}"\n\nFormat this text, summarize what it is, and answer the user's question directly in spokenReply.`;
+    } else {
+      userMessage += `\n\nNo text was found in the image. Return a JSON response acknowledging this.`;
+    }
+
+    const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${groqKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "llama3-8b-8192",
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userMessage }
+        ],
+        temperature: 0.1,
+        max_tokens: 1024
+      })
+    });
+
+    if (!groqResponse.ok) {
+      const errText = await groqResponse.text();
+      log.error({ errText }, "Groq error");
+      throw new Error(`Groq returned ${groqResponse.status}`);
+    }
+
+    const groqData = await groqResponse.json() as any;
+    const text = groqData.choices?.[0]?.message?.content || "";
+    log.info({ elapsed: Date.now() - groqStartTime }, "Groq finished");
 
     const parsed = tryParseJson(text) as Record<string, unknown>;
     const overlaysRaw = Array.isArray(parsed.overlays) ? parsed.overlays : [];
-    const overlays = topOverlays(overlaysRaw.slice(0, 12).map(normalizeOverlay));
+    
+    // We don't have bounding boxes from Groq since it's just processing text.
+    // So we map the text to a single overlay in the center of the screen if there's text.
+    const overlays: VisionOverlay[] = [];
+    if (extractedText.trim().length > 0) {
+      overlays.push({
+        id: "ov-text",
+        kind: "text",
+        label: "Document / Text",
+        detail: extractedText.substring(0, 50).replace(/\n/g, ' ') + "...",
+        severity: "info",
+        x: 0.5,
+        y: 0.5,
+        w: 0.6,
+        h: 0.4
+      });
+    }
 
     let sceneSummary = typeof parsed.sceneSummary === "string" && parsed.sceneSummary.length > 0
       ? parsed.sceneSummary.slice(0, 140)
-      : "Scene analyzed.";
-    
-    // Block generic summaries
-    const genericPhrases = ["environment detected", "scene captured", "nothing notable", "analysis timed out"];
-    if (genericPhrases.some(p => sceneSummary.toLowerCase().includes(p))) {
-      sceneSummary = "Scene analyzed.";
-    }
+      : "Text analysis complete.";
 
     return {
       sceneSummary,
-      spokenReply:
-        typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
-      primaryFocus:
-        typeof parsed.primaryFocus === "string" ? parsed.primaryFocus : "scene",
+      spokenReply: typeof parsed.spokenReply === "string" ? parsed.spokenReply.slice(0, 400) : "",
+      primaryFocus: "text",
       overlays,
     };
   } catch (err) {
     log.error({ err }, "Vision analysis failed");
     const reason = err instanceof Error ? err.message : "Unknown error.";
     return fallbackResult(reason);
+  }
+}on);
   }
 }

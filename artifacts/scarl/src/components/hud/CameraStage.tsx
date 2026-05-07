@@ -1,5 +1,6 @@
 import React, { useRef, useEffect } from 'react';
 import type { Overlay } from '@workspace/api-client-react';
+import { ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 
 interface CameraStageProps {
   onFrameCapture: (base64: string) => void;
@@ -8,82 +9,13 @@ interface CameraStageProps {
   fallbackImage: string | null;
 }
 
-type CocoModel = {
-  detect: (input: HTMLVideoElement) => Promise<Array<{
-    bbox: [number, number, number, number];
-    class: string;
-    score: number;
-  }>>;
-};
-
 // Faster detection — 200ms for near-realtime bounding
 const LOCAL_DETECTION_INTERVAL_MS = 200;
 const LOCAL_DETECTION_SCORE = 0.45;
 const LOCAL_DETECTION_MAX = 10;
 
-const LABEL_MAP: Record<string, string> = {
-  tv: 'TV',
-  laptop: 'Laptop',
-  'cell phone': 'Phone',
-  'potted plant': 'Plant',
-  'dining table': 'Table',
-  couch: 'Sofa',
-  chair: 'Chair',
-  person: 'Person',
-  keyboard: 'Keyboard',
-  mouse: 'Mouse',
-  book: 'Book',
-  cup: 'Cup',
-  bottle: 'Bottle',
-  clock: 'Clock',
-  vase: 'Vase',
-  scissors: 'Scissors',
-  remote: 'Remote',
-  microwave: 'Microwave',
-  oven: 'Oven',
-  toaster: 'Toaster',
-  refrigerator: 'Fridge',
-  sink: 'Sink',
-  car: 'Car',
-  bicycle: 'Bicycle',
-  dog: 'Dog',
-  cat: 'Cat',
-  backpack: 'Backpack',
-  handbag: 'Handbag',
-  umbrella: 'Umbrella',
-  tie: 'Tie',
-  suitcase: 'Suitcase',
-  bowl: 'Bowl',
-  banana: 'Banana',
-  apple: 'Apple',
-  sandwich: 'Sandwich',
-  pizza: 'Pizza',
-  donut: 'Donut',
-  cake: 'Cake',
-  bed: 'Bed',
-  toilet: 'Toilet',
-  surfboard: 'Surfboard',
-  'sports ball': 'Ball',
-  'wine glass': 'Glass',
-  fork: 'Fork',
-  knife: 'Knife',
-  spoon: 'Spoon',
-  skateboard: 'Skateboard',
-  truck: 'Truck',
-  bus: 'Bus',
-  motorcycle: 'Motorcycle',
-  airplane: 'Airplane',
-  train: 'Train',
-  boat: 'Boat',
-  bird: 'Bird',
-  horse: 'Horse',
-  sheep: 'Sheep',
-  cow: 'Cow',
-  bear: 'Bear',
-};
-
 function labelFor(className: string) {
-  return LABEL_MAP[className] ?? className
+  return className
     .split(/\s+/)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
@@ -91,9 +23,10 @@ function labelFor(className: string) {
 
 function mapVideoBoxToViewport(
   video: HTMLVideoElement,
-  bbox: [number, number, number, number],
-) {
-  const [bx, by, bw, bh] = bbox;
+  bbox: { originX: number, originY: number, width: number, height: number },
+  className: string,
+  score: number
+): Overlay | null {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   const cw = video.clientWidth;
@@ -107,10 +40,10 @@ function mapVideoBoxToViewport(
   const offsetX = (cw - renderedW) / 2;
   const offsetY = (ch - renderedH) / 2;
 
-  const left = (bx * scale + offsetX) / cw;
-  const top = (by * scale + offsetY) / ch;
-  const width = (bw * scale) / cw;
-  const height = (bh * scale) / ch;
+  const left = (bbox.originX * scale + offsetX) / cw;
+  const top = (bbox.originY * scale + offsetY) / ch;
+  const width = (bbox.width * scale) / cw;
+  const height = (bbox.height * scale) / ch;
 
   const x = left + width / 2;
   const y = top + height / 2;
@@ -118,6 +51,11 @@ function mapVideoBoxToViewport(
   if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) return null;
 
   return {
+    id: `local-${className}-${Math.random()}`,
+    kind: className.toLowerCase() === 'person' ? 'person' : 'object',
+    label: labelFor(className),
+    detail: `${Math.round(score * 100)}%`,
+    severity: 'low',
     x: Math.min(Math.max(x, 0), 1),
     y: Math.min(Math.max(y, 0), 1),
     w: Math.min(Math.max(width, 0.03), 0.9),
@@ -128,7 +66,7 @@ function mapVideoBoxToViewport(
 export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, fallbackImage }: CameraStageProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const detectorRef = useRef<CocoModel | null>(null);
+  const detectorRef = useRef<ObjectDetector | null>(null);
 
   useEffect(() => {
     let stream: MediaStream | null = null;
@@ -139,24 +77,20 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
 
     async function startCamera() {
       try {
-        // Request wide-angle camera with lower resolution for speed
-        // Lower resolution = faster COCO-SSD inference + wider FOV on many devices
         const constraints: MediaStreamConstraints = {
           video: {
             facingMode: isFrontCamera ? 'user' : 'environment',
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            // Request widest possible field of view
+            width: { ideal: 1920 }, // High res for OCR
+            height: { ideal: 1080 },
             ...(navigator.mediaDevices && {
               advanced: [
-                { zoom: 1.0 } as any, // Minimum zoom = widest FOV
+                { zoom: 1.0 } as any, 
               ],
             }),
           },
         };
         stream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        // Try to set minimum zoom on the track for widest view
         const videoTrack = stream.getVideoTracks()[0];
         if (videoTrack) {
           try {
@@ -166,9 +100,7 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
                 advanced: [{ zoom: capabilities.zoom.min } as any],
               } as any);
             }
-          } catch (_) {
-            // Zoom control not supported — that's fine
-          }
+          } catch (_) {}
         }
 
         if (videoRef.current) {
@@ -185,7 +117,7 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
     };
   }, [isFrontCamera, fallbackImage, onLocalDetections]);
 
-  // Local COCO-SSD detector — runs continuously for real-time bounding boxes
+  // Local MediaPipe detector
   useEffect(() => {
     let cancelled = false;
     let running = false;
@@ -194,24 +126,21 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
 
     async function loadDetector() {
       try {
-        const tf = await import('@tensorflow/tfjs');
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+        );
+        const detector = await ObjectDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite",
+            delegate: "GPU"
+          },
+          scoreThreshold: LOCAL_DETECTION_SCORE,
+          runningMode: "VIDEO"
+        });
         
-        // Try WebGPU acceleration first for massive speedup
-        try {
-          await import('@tensorflow/tfjs-backend-webgpu');
-          await tf.setBackend('webgpu');
-          await tf.ready();
-          console.log('[SCARL] Using WebGPU backend for instant detection');
-        } catch (e) {
-          console.warn('[SCARL] WebGPU not supported on this device, falling back to default backend', e);
-          // Default to WebGL or CPU
-          await tf.ready();
-        }
-
-        const coco = await import('@tensorflow-models/coco-ssd');
         if (cancelled) return;
-        // lite_mobilenet_v2 is the fastest model variant
-        detectorRef.current = await coco.load({ base: 'lite_mobilenet_v2' }) as CocoModel;
+        detectorRef.current = detector;
+        console.log('[SCARL] MediaPipe EfficientDet Loaded on GPU');
         scheduleDetection();
       } catch (err) {
         console.error('[SCARL] Local detector failed to load', err);
@@ -242,25 +171,18 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
 
       running = true;
       try {
-        const predictions = await detector.detect(video);
-        const overlays = predictions
-          .filter((p) => p.score >= LOCAL_DETECTION_SCORE)
-          .sort((a, b) => b.score - a.score)
+        const detections = detector.detectForVideo(video, performance.now());
+        const overlays = detections.detections
+          .filter(d => d.categories && d.categories.length > 0 && d.categories[0].score >= LOCAL_DETECTION_SCORE)
+          .sort((a, b) => b.categories[0].score - a.categories[0].score)
           .slice(0, LOCAL_DETECTION_MAX)
-          .map((p, index): Overlay | null => {
-            const box = mapVideoBoxToViewport(video, p.bbox);
-            if (!box) return null;
-            const label = labelFor(p.class);
-            return {
-              id: `local-${p.class}-${index}`,
-              kind: p.class === 'person' ? 'person' : 'object',
-              label,
-              detail: `${Math.round(p.score * 100)}%`,
-              severity: 'low',
-              ...box,
-            };
+          .map(d => {
+            const cat = d.categories[0];
+            const bbox = d.boundingBox;
+            if (!bbox) return null;
+            return mapVideoBoxToViewport(video, bbox, cat.categoryName, cat.score);
           })
-          .filter((o): o is Overlay => Boolean(o));
+          .filter(Boolean) as Overlay[];
 
         onLocalDetections(overlays);
       } catch (err) {
@@ -275,6 +197,9 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
     return () => {
       cancelled = true;
       if (rafId) cancelAnimationFrame(rafId);
+      if (detectorRef.current) {
+        detectorRef.current.close();
+      }
     };
   }, [fallbackImage, onLocalDetections]);
 
@@ -286,7 +211,7 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
   useEffect(() => {
     const MOTION_W = 64;
     const MOTION_H = 64;
-    const MSE_THRESHOLD = 300; // Lower threshold = capture more frames
+    const MSE_THRESHOLD = 300; 
 
     const captureInterval = setInterval(() => {
       if (!videoRef.current || !canvasRef.current || fallbackImage) return;
@@ -324,11 +249,10 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
           }
         }
 
-        // Always capture at least the first frame, then on motion or every capture cycle
         if (hasMotion || !frameCapturedRef.current) {
           frameCapturedRef.current = true;
-          // Text analysis requires high resolution. We aim for 1280px but compress aggressively to stay under NIM 180KB inline limit.
-          const MAX_W = 1280;
+          // High resolution for OCR.space
+          const MAX_W = 1280; 
           const ratio = video.videoWidth > MAX_W ? MAX_W / video.videoWidth : 1;
           canvas.width = Math.round(video.videoWidth * ratio);
           canvas.height = Math.round(video.videoHeight * ratio);
@@ -336,10 +260,10 @@ export function CameraStage({ onFrameCapture, onLocalDetections, isFrontCamera, 
           if (ctx) {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             
-            // Dynamic compression to stay under ~180KB base64 limit (approx 240,000 chars)
             let quality = 0.8;
             let dataUrl = canvas.toDataURL('image/jpeg', quality);
-            while (dataUrl.length > 230000 && quality > 0.1) {
+            // Limit to ~900KB base64 string to fit OCR.space free tier limit (1MB)
+            while (dataUrl.length > 1200000 && quality > 0.1) {
               quality -= 0.1;
               dataUrl = canvas.toDataURL('image/jpeg', quality);
             }
